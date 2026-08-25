@@ -77,9 +77,19 @@ function makeMeter(id) {
     error: false,
     statusSensor: 0,
     statusDevice: 0,
+    wordOrder: "ABCD",
     logs: [],
     pending: null
   };
+}
+
+const serverLog = [];
+const MAX_SERVER_LOGS = 300;
+
+function slog(line) {
+  serverLog.push(`[${ts()}] ${line}`);
+  if (serverLog.length > MAX_SERVER_LOGS) serverLog.splice(0, serverLog.length - MAX_SERVER_LOGS);
+  console.log(line);
 }
 
 const MAX_LOGS = 300;
@@ -119,12 +129,6 @@ function logWrite(m, fc, label, addr, value) {
 const meters = [];
 for (let i = 1; i <= METER_COUNT; i++) meters.push(makeMeter(i));
 
-function meterByUnit(unitID) {
-  const m = meters[unitID - 1];
-  if (!m) throw new Error("Invalid unit ID " + unitID);
-  return m;
-}
-
 function computeOutputs(m) {
   const limLo = readFloatBE(m.holding, 3000);
   const limHi = readFloatBE(m.holding, 3002);
@@ -162,6 +166,23 @@ setInterval(() => {
   }
 }, TICK_MS);
 
+function permuteElem(arr, start, nRegs, order) {
+  if (order === "ABCD") return;
+  const tmp = [];
+  for (let i = 0; i < nRegs; i++) tmp.push(arr[start + i]);
+  const bswap = (v) => ((v & 0xff) << 8) | (v >> 8);
+  if (order === "BADC") {
+    for (let i = 0; i < nRegs; i++) arr[start + i] = bswap(tmp[i]);
+  } else if (order === "CDAB") {
+    for (let g = 0; g + 1 < nRegs; g += 2) {
+      arr[start + g] = tmp[g + 1];
+      arr[start + g + 1] = tmp[g];
+    }
+  } else if (order === "DCBA") {
+    for (let i = 0; i < nRegs; i++) arr[start + i] = bswap(tmp[nRegs - 1 - i]);
+  }
+}
+
 function inputRegisterBlock(m) {
   const r = new Uint16Array(20);
   writeFloatBE(r, 0, m.dispSpeed);
@@ -174,6 +195,12 @@ function inputRegisterBlock(m) {
   r[17] = m.statusSensor & 0xffff;
   r[18] = (m.statusDevice >>> 16) & 0xffff;
   r[19] = m.statusDevice & 0xffff;
+  permuteElem(r, 0, 2, m.wordOrder);
+  permuteElem(r, 2, 2, m.wordOrder);
+  permuteElem(r, 4, 2, m.wordOrder);
+  permuteElem(r, 6, 2, m.wordOrder);
+  permuteElem(r, 8, 4, m.wordOrder);
+  permuteElem(r, 12, 4, m.wordOrder);
   return r;
 }
 
@@ -181,10 +208,9 @@ function getCoilState(m, addr) {
   switch (addr) {
     case 3000: return m.c1run;
     case 3001: return m.c2run;
-    case 3002: return false;
     case 3003: return false;
     case 3004: return false;
-    default: throw new Error("Illegal coil address " + addr);
+    default: return false;
   }
 }
 
@@ -194,62 +220,84 @@ function setCoilState(m, addr, value) {
     case 3001: m.c2run = !!value; break;
     case 3003: if (value) m.counter1 = 0; break;
     case 3004: if (value) m.counter2 = 0; break;
-    default: throw new Error("Illegal coil address " + addr);
+    default: break;
   }
+}
+
+function meterOrNull(unitID) {
+  return meters[unitID - 1] || null;
 }
 
 const vector = {
   getInputRegister: (addr, unitID) =>
-    new Promise((resolve, reject) => {
-      try {
-        const m = meterByUnit(unitID);
-        const n = normInput(addr);
-        const block = inputRegisterBlock(m);
-        if (n < 0 || n >= block.length) return reject(new Error("Illegal input register " + addr));
+    new Promise((resolve) => {
+      const m = meterOrNull(unitID);
+      if (!m) {
+        slog(`REJECTED FC04 unit=${unitID} addr=${addr}: unknown unit ID (simulator serves 1-${METER_COUNT})`);
+        return resolve(0);
+      }
+      const n = normInput(addr);
+      const block = inputRegisterBlock(m);
+      if (n < 0 || n >= block.length) {
         logRead(m, "FC04", "InputReg", addr);
-        resolve(block[n]);
-      } catch (e) { reject(e); }
+        return resolve(0);
+      }
+      logRead(m, "FC04", "InputReg", addr);
+      resolve(block[n]);
+    }),
+  getDiscreteInput: (addr, unitID) =>
+    new Promise((resolve) => {
+      const m = meterOrNull(unitID);
+      if (!m) {
+        slog(`REJECTED FC02 unit=${unitID} addr=${addr}: unknown unit ID (simulator serves 1-${METER_COUNT})`);
+        return resolve(false);
+      }
+      logRead(m, "FC02", "DiscreteIn", addr);
+      resolve(getCoilState(m, addr));
     }),
   getHoldingRegister: (addr, unitID) =>
-    new Promise((resolve, reject) => {
-      try {
-        const m = meterByUnit(unitID);
-        const n = normHolding(addr);
-        if (n < 0 || n >= m.holding.length) return reject(new Error("Illegal holding register " + addr));
-        logRead(m, "FC03", "HoldingReg", addr);
-        resolve(m.holding[n]);
-      } catch (e) { reject(e); }
+    new Promise((resolve) => {
+      const m = meterOrNull(unitID);
+      if (!m) {
+        slog(`REJECTED FC03 unit=${unitID} addr=${addr}: unknown unit ID (simulator serves 1-${METER_COUNT})`);
+        return resolve(0);
+      }
+      const n = normHolding(addr);
+      logRead(m, "FC03", "HoldingReg", addr);
+      resolve(n >= 0 && n < m.holding.length ? m.holding[n] : 0);
     }),
   getCoil: (addr, unitID) =>
-    new Promise((resolve, reject) => {
-      try {
-        const m = meterByUnit(unitID);
-        const v = getCoilState(m, addr);
-        logRead(m, "FC01", "Coil", addr);
-        resolve(v);
-      } catch (e) { reject(e); }
+    new Promise((resolve) => {
+      const m = meterOrNull(unitID);
+      if (!m) {
+        slog(`REJECTED FC01 unit=${unitID} addr=${addr}: unknown unit ID (simulator serves 1-${METER_COUNT})`);
+        return resolve(false);
+      }
+      logRead(m, "FC01", "Coil", addr);
+      resolve(getCoilState(m, addr));
     }),
   setCoil: (addr, value, unitID) =>
-    new Promise((resolve, reject) => {
-      try {
-        const m = meterByUnit(unitID);
-        setCoilState(m, addr, value);
-        logWrite(m, "FC05", "Coil", addr, value ? 1 : 0);
-        console.log(`[unit ${unitID}] coil ${addr} <- ${value ? 1 : 0}`);
-        resolve();
-      } catch (e) { reject(e); }
+    new Promise((resolve) => {
+      const m = meterOrNull(unitID);
+      if (!m) {
+        slog(`REJECTED FC05 unit=${unitID} addr=${addr}: unknown unit ID (simulator serves 1-${METER_COUNT})`);
+        return resolve();
+      }
+      setCoilState(m, addr, value);
+      logWrite(m, "FC05", "Coil", addr, value ? 1 : 0);
+      resolve();
     }),
   setRegister: (addr, value, unitID) =>
-    new Promise((resolve, reject) => {
-      try {
-        const m = meterByUnit(unitID);
-        const n = normHolding(addr);
-        if (n < 0 || n >= m.holding.length) return reject(new Error("Illegal holding register " + addr));
-        m.holding[n] = value & 0xffff;
-        logWrite(m, "FC16", "HoldingReg", addr, value);
-        console.log(`[unit ${unitID}] holding ${addr} <- ${value}`);
-        resolve();
-      } catch (e) { reject(e); }
+    new Promise((resolve) => {
+      const m = meterOrNull(unitID);
+      if (!m) {
+        slog(`REJECTED FC06/16 unit=${unitID} addr=${addr}: unknown unit ID (simulator serves 1-${METER_COUNT})`);
+        return resolve();
+      }
+      const n = normHolding(addr);
+      if (n >= 0 && n < m.holding.length) m.holding[n] = value & 0xffff;
+      logWrite(m, "FC06/16", "HoldingReg", addr, value);
+      resolve();
     })
 };
 
@@ -285,6 +333,7 @@ function meterState(m) {
     density: m.density,
     statusSensor: m.statusSensor,
     statusDevice: m.statusDevice,
+    wordOrder: m.wordOrder,
     logs: m.logs,
     holding: {
       flowDirection: m.holding[2000],
@@ -307,7 +356,7 @@ function meterState(m) {
 }
 
 app.get("/api/state", (req, res) => {
-  res.json({ meters: meters.map(meterState) });
+  res.json({ meters: meters.map(meterState), serverLog });
 });
 
 app.post("/api/meter/:id", (req, res) => {
@@ -319,6 +368,7 @@ app.post("/api/meter/:id", (req, res) => {
   if (typeof b.error === "boolean") m.error = b.error;
   if (typeof b.pipeDiamMm === "number" && b.pipeDiamMm > 0) m.pipeDiamMm = b.pipeDiamMm;
   if (typeof b.density === "number" && b.density > 0) m.density = b.density;
+  if (typeof b.wordOrder === "string" && ["ABCD", "BADC", "CDAB", "DCBA"].includes(b.wordOrder)) m.wordOrder = b.wordOrder;
   res.json(meterState(m));
 });
 

@@ -23,6 +23,7 @@
   button { background: #23406b; border: 1px solid #30507f; color: #cfe1ff; border-radius: 4px; padding: 4px 10px; font-size: 12px; cursor: pointer; }
   button:hover { background: #2b4f83; }
   button.on { background: #1e5b34; border-color: #2e7a4a; color: #b9f5cd; }
+  select { background: #12161c; border: 1px solid #2a3342; color: #d7dde6; border-radius: 4px; padding: 4px 6px; font-size: 12px; }
   table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 6px; }
   td, th { border: 1px solid #2a3342; padding: 3px 6px; text-align: right; }
   th { text-align: left; color: #8c99ad; font-weight: normal; }
@@ -40,6 +41,12 @@
   <span>Modbus TCP port 502 &middot; Unit IDs 1-3</span>
 </header>
 <main id="cards"></main>
+<div style="padding: 0 20px 16px;">
+  <div class="card">
+    <h2>Server log <span class="badge">rejected / unknown-unit requests appear here</span></h2>
+    <textarea class="log" id="srvlog" rows="4" readonly></textarea>
+  </div>
+</div>
 
 <script>
 const main = document.getElementById("cards");
@@ -69,6 +76,15 @@ function build() {
         <label>Pipe &Oslash; [mm]</label><input type="number" id="dm${i}" step="1" style="width:70px">
         <label>Density [kg/m&sup3;]</label><input type="number" id="dn${i}" step="1" style="width:80px">
         <button onclick="applyGeo(${i})">Apply</button>
+      </div>
+      <div class="row">
+        <label>Float word order (FC04 values)</label>
+        <select id="wo${i}" onchange="api('/api/meter/${i}', { wordOrder: this.value })">
+          <option value="ABCD">ABCD (IFC050 standard)</option>
+          <option value="CDAB">CDAB (word swap)</option>
+          <option value="BADC">BADC (byte swap)</option>
+          <option value="DCBA">DCBA (full reverse)</option>
+        </select>
       </div>
       <table class="vals">
         <tr><td>Flow speed</td><td id="vs${i}">-</td><td>m/s</td></tr>
@@ -190,6 +206,14 @@ async function refresh() {
         logEl.value = text;
         if (stuck) logEl.scrollTop = logEl.scrollHeight;
       }
+      const wo = document.getElementById("wo" + i);
+      if (wo.value !== m.wordOrder) wo.value = m.wordOrder;
+    }
+    const srvEl = document.getElementById("srvlog");
+    const srvText = state.serverLog.join("\n");
+    if (srvEl.value !== srvText) {
+      srvEl.value = srvText;
+      srvEl.scrollTop = srvEl.scrollHeight;
     }
   } catch (e) { /* retry next tick */ }
 }
