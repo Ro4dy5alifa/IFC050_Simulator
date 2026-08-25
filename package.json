@@ -10,6 +10,6 @@
   "dependencies": {
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "modbus-serial": "^8.0.13"
+    "modbus-tcp": "^0.4.13"
   }
 }

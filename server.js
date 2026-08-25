@@ -1,7 +1,8 @@
 require("dotenv").config();
 const path = require("path");
+const net = require("net");
 const express = require("express");
-const ModbusRTU = require("modbus-serial");
+const modbus = require("modbus-tcp");
 
 const MODBUS_PORT = Number(process.env.MODBUS_PORT || 502);
 const MODBUS_HOST = process.env.MODBUS_HOST || "0.0.0.0";
@@ -78,8 +79,7 @@ function makeMeter(id) {
     statusSensor: 0,
     statusDevice: 0,
     wordOrder: "ABCD",
-    logs: [],
-    pending: null
+    logs: []
   };
 }
 
@@ -99,29 +99,14 @@ function ts() {
   return d.toTimeString().slice(0, 8) + "." + String(d.getMilliseconds()).padStart(3, "0");
 }
 
-function flushPending(m) {
-  if (!m.pending) return;
-  const p = m.pending;
-  const range = p.end > p.start ? `${p.start}-${p.end}` : `${p.start}`;
-  const qty = p.end - p.start + 1;
-  m.logs.push(`[${p.time}] ${p.fc} ${p.label} ${range} (${qty} reg${qty > 1 ? "s" : ""})`);
+function logRange(m, fc, label, from, to) {
+  const range = to > from ? `${from}-${to}` : `${from}`;
+  const qty = to - from + 1;
+  m.logs.push(`[${ts()}] ${fc} ${label} ${range} (${qty} reg${qty > 1 ? "s" : ""})`);
   if (m.logs.length > MAX_LOGS) m.logs.splice(0, m.logs.length - MAX_LOGS);
-  m.pending = null;
-}
-
-function logRead(m, fc, label, addr) {
-  if (m.pending && m.pending.fc === fc && addr === m.pending.end + 1) {
-    m.pending.end = addr;
-    clearTimeout(m.pending.timer);
-    m.pending.timer = setTimeout(() => flushPending(m), 150);
-    return;
-  }
-  flushPending(m);
-  m.pending = { fc, label, start: addr, end: addr, time: ts(), timer: setTimeout(() => flushPending(m), 150) };
 }
 
 function logWrite(m, fc, label, addr, value) {
-  flushPending(m);
   m.logs.push(`[${ts()}] ${fc} ${label} ${addr} <- ${value}`);
   if (m.logs.length > MAX_LOGS) m.logs.splice(0, m.logs.length - MAX_LOGS);
 }
@@ -228,87 +213,142 @@ function meterOrNull(unitID) {
   return meters[unitID - 1] || null;
 }
 
-const vector = {
-  getInputRegister: (addr, unitID) =>
-    new Promise((resolve) => {
-      const m = meterOrNull(unitID);
-      if (!m) {
-        slog(`REJECTED FC04 unit=${unitID} addr=${addr}: unknown unit ID (simulator serves 1-${METER_COUNT})`);
-        return resolve(0);
-      }
-      const n = normInput(addr);
-      const block = inputRegisterBlock(m);
-      if (n < 0 || n >= block.length) {
-        logRead(m, "FC04", "InputReg", addr);
-        return resolve(0);
-      }
-      logRead(m, "FC04", "InputReg", addr);
-      resolve(block[n]);
-    }),
-  getDiscreteInput: (addr, unitID) =>
-    new Promise((resolve) => {
-      const m = meterOrNull(unitID);
-      if (!m) {
-        slog(`REJECTED FC02 unit=${unitID} addr=${addr}: unknown unit ID (simulator serves 1-${METER_COUNT})`);
-        return resolve(false);
-      }
-      logRead(m, "FC02", "DiscreteIn", addr);
-      resolve(getCoilState(m, addr));
-    }),
-  getHoldingRegister: (addr, unitID) =>
-    new Promise((resolve) => {
-      const m = meterOrNull(unitID);
-      if (!m) {
-        slog(`REJECTED FC03 unit=${unitID} addr=${addr}: unknown unit ID (simulator serves 1-${METER_COUNT})`);
-        return resolve(0);
-      }
-      const n = normHolding(addr);
-      logRead(m, "FC03", "HoldingReg", addr);
-      resolve(n >= 0 && n < m.holding.length ? m.holding[n] : 0);
-    }),
-  getCoil: (addr, unitID) =>
-    new Promise((resolve) => {
-      const m = meterOrNull(unitID);
-      if (!m) {
-        slog(`REJECTED FC01 unit=${unitID} addr=${addr}: unknown unit ID (simulator serves 1-${METER_COUNT})`);
-        return resolve(false);
-      }
-      logRead(m, "FC01", "Coil", addr);
-      resolve(getCoilState(m, addr));
-    }),
-  setCoil: (addr, value, unitID) =>
-    new Promise((resolve) => {
-      const m = meterOrNull(unitID);
-      if (!m) {
-        slog(`REJECTED FC05 unit=${unitID} addr=${addr}: unknown unit ID (simulator serves 1-${METER_COUNT})`);
-        return resolve();
-      }
-      setCoilState(m, addr, value);
-      logWrite(m, "FC05", "Coil", addr, value ? 1 : 0);
-      resolve();
-    }),
-  setRegister: (addr, value, unitID) =>
-    new Promise((resolve) => {
-      const m = meterOrNull(unitID);
-      if (!m) {
-        slog(`REJECTED FC06/16 unit=${unitID} addr=${addr}: unknown unit ID (simulator serves 1-${METER_COUNT})`);
-        return resolve();
-      }
-      const n = normHolding(addr);
-      if (n >= 0 && n < m.holding.length) m.holding[n] = value & 0xffff;
-      logWrite(m, "FC06/16", "HoldingReg", addr, value);
-      resolve();
-    })
-};
+function regBuf(v) {
+  const b = Buffer.alloc(2);
+  b.writeUInt16BE(v & 0xffff, 0);
+  return b;
+}
 
-const serverTCP = new ModbusRTU.ServerTCP(vector, {
-  host: MODBUS_HOST,
-  port: MODBUS_PORT,
-  debug: false
+function zeroRegs(n) {
+  const out = [];
+  for (let i = 0; i < n; i++) out.push(regBuf(0));
+  return out;
+}
+
+function zeroBits(n) {
+  return new Array(n).fill(0);
+}
+
+const mbServer = net.createServer((socket) => {
+  const peer = `${socket.remoteAddress}:${socket.remotePort}`;
+  slog(`client connected: ${peer}`);
+  socket.on("close", () => slog(`client disconnected: ${peer}`));
+  socket.on("error", (e) => slog(`client ${peer} socket error: ${e.message}`));
+
+  const s = new modbus.Server();
+  s.on("error", () => {});
+  s.pipe(socket);
+
+  s.on("read-input-registers", (from, to, reply, data) => {
+    const m = meterOrNull(data.unitId);
+    if (!m) {
+      slog(`REJECTED FC04 unit=${data.unitId} ${from}-${to}: unknown unit ID (simulator serves 1-${METER_COUNT})`);
+      return reply(null, zeroRegs(to - from + 1));
+    }
+    logRange(m, "FC04", "InputReg", from, to);
+    const block = inputRegisterBlock(m);
+    const out = [];
+    for (let a = from; a <= to; a++) {
+      const n = normInput(a);
+      out.push(regBuf(n >= 0 && n < block.length ? block[n] : 0));
+    }
+    reply(null, out);
+  });
+
+  s.on("read-holding-registers", (from, to, reply, data) => {
+    const m = meterOrNull(data.unitId);
+    if (!m) {
+      slog(`REJECTED FC03 unit=${data.unitId} ${from}-${to}: unknown unit ID (simulator serves 1-${METER_COUNT})`);
+      return reply(null, zeroRegs(to - from + 1));
+    }
+    logRange(m, "FC03", "HoldingReg", from, to);
+    const out = [];
+    for (let a = from; a <= to; a++) {
+      const n = normHolding(a);
+      out.push(regBuf(n >= 0 && n < m.holding.length ? m.holding[n] : 0));
+    }
+    reply(null, out);
+  });
+
+  const coilRead = (fc) => (from, to, reply, data) => {
+    const m = meterOrNull(data.unitId);
+    if (!m) {
+      slog(`REJECTED ${fc} unit=${data.unitId} ${from}-${to}: unknown unit ID (simulator serves 1-${METER_COUNT})`);
+      return reply(null, zeroBits(to - from + 1));
+    }
+    logRange(m, fc, "Coil", from, to);
+    const out = [];
+    for (let a = from; a <= to; a++) out.push(getCoilState(m, a) ? 1 : 0);
+    reply(null, out);
+  };
+  s.on("read-coils", coilRead("FC01"));
+  s.on("read-discrete-inputs", coilRead("FC02"));
+
+  s.on("write-single-coil", (address, value, reply, data) => {
+    const m = meterOrNull(data.unitId);
+    const v = value[0] === 0xff;
+    if (!m) {
+      slog(`REJECTED FC05 unit=${data.unitId} addr=${address}: unknown unit ID (simulator serves 1-${METER_COUNT})`);
+      return reply(null);
+    }
+    setCoilState(m, address, v);
+    logWrite(m, "FC05", "Coil", address, v ? 1 : 0);
+    reply(null);
+  });
+
+  s.on("write-multiple-coils", (from, to, items, reply, data) => {
+    const m = meterOrNull(data.unitId);
+    if (!m) {
+      slog(`REJECTED FC15 unit=${data.unitId} ${from}-${to}: unknown unit ID (simulator serves 1-${METER_COUNT})`);
+      return reply(null);
+    }
+    items.forEach((bit, i) => {
+      setCoilState(m, from + i, !!bit);
+      logWrite(m, "FC15", "Coil", from + i, bit);
+    });
+    reply(null);
+  });
+
+  s.on("write-single-register", (address, value, reply, data) => {
+    const m = meterOrNull(data.unitId);
+    const v = value.readUInt16BE(0);
+    if (!m) {
+      slog(`REJECTED FC06 unit=${data.unitId} addr=${address}: unknown unit ID (simulator serves 1-${METER_COUNT})`);
+      return reply(null);
+    }
+    const n = normHolding(address);
+    if (n >= 0 && n < m.holding.length) m.holding[n] = v;
+    logWrite(m, "FC06", "HoldingReg", address, v);
+    reply(null);
+  });
+
+  s.on("write-multiple-registers", (from, to, items, reply, data) => {
+    const m = meterOrNull(data.unitId);
+    if (!m) {
+      slog(`REJECTED FC16 unit=${data.unitId} ${from}-${to}: unknown unit ID (simulator serves 1-${METER_COUNT})`);
+      return reply(null);
+    }
+    items.forEach((buf, i) => {
+      const n = normHolding(from + i);
+      const v = buf.readUInt16BE(0);
+      if (n >= 0 && n < m.holding.length) m.holding[n] = v;
+      logWrite(m, "FC16", "HoldingReg", from + i, v);
+    });
+    reply(null);
+  });
+
+  s.on("data", (d) => {
+    slog(`unsupported function code '${d.functionCode}' from unit=${d.unitId}`);
+  });
 });
 
-serverTCP.on("socketError", (err) => console.error("Modbus socket error:", err.message));
-console.log(`IFC050 Modbus TCP server listening on ${MODBUS_HOST}:${MODBUS_PORT} (unit IDs 1-${METER_COUNT})`);
+mbServer.on("error", (e) => {
+  console.error("Modbus server error:", e.message);
+  process.exit(1);
+});
+mbServer.listen(MODBUS_PORT, MODBUS_HOST, () => {
+  console.log(`IFC050 Modbus TCP server (modbus-tcp) listening on ${MODBUS_HOST}:${MODBUS_PORT} (unit IDs 1-${METER_COUNT})`);
+});
 
 const app = express();
 app.use(express.json());
