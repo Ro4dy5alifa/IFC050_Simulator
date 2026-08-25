@@ -5,7 +5,7 @@ const ModbusRTU = require("modbus-serial");
 
 const MODBUS_PORT = Number(process.env.MODBUS_PORT || 502);
 const MODBUS_HOST = process.env.MODBUS_HOST || "0.0.0.0";
-const WEB_PORT = Number(process.env.WEB_PORT || 8080);
+const WEB_PORT = Number(process.env.WEB_PORT || 8081);
 const METER_COUNT = 3;
 const TICK_MS = 100;
 
