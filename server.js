@@ -1,3 +1,4 @@
+require("dotenv").config();
 const path = require("path");
 const express = require("express");
 const ModbusRTU = require("modbus-serial");
@@ -75,8 +76,44 @@ function makeMeter(id) {
     emptyPipe: false,
     error: false,
     statusSensor: 0,
-    statusDevice: 0
+    statusDevice: 0,
+    logs: [],
+    pending: null
   };
+}
+
+const MAX_LOGS = 300;
+
+function ts() {
+  const d = new Date();
+  return d.toTimeString().slice(0, 8) + "." + String(d.getMilliseconds()).padStart(3, "0");
+}
+
+function flushPending(m) {
+  if (!m.pending) return;
+  const p = m.pending;
+  const range = p.end > p.start ? `${p.start}-${p.end}` : `${p.start}`;
+  const qty = p.end - p.start + 1;
+  m.logs.push(`[${p.time}] ${p.fc} ${p.label} ${range} (${qty} reg${qty > 1 ? "s" : ""})`);
+  if (m.logs.length > MAX_LOGS) m.logs.splice(0, m.logs.length - MAX_LOGS);
+  m.pending = null;
+}
+
+function logRead(m, fc, label, addr) {
+  if (m.pending && m.pending.fc === fc && addr === m.pending.end + 1) {
+    m.pending.end = addr;
+    clearTimeout(m.pending.timer);
+    m.pending.timer = setTimeout(() => flushPending(m), 150);
+    return;
+  }
+  flushPending(m);
+  m.pending = { fc, label, start: addr, end: addr, time: ts(), timer: setTimeout(() => flushPending(m), 150) };
+}
+
+function logWrite(m, fc, label, addr, value) {
+  flushPending(m);
+  m.logs.push(`[${ts()}] ${fc} ${label} ${addr} <- ${value}`);
+  if (m.logs.length > MAX_LOGS) m.logs.splice(0, m.logs.length - MAX_LOGS);
 }
 
 const meters = [];
@@ -169,6 +206,7 @@ const vector = {
         const n = normInput(addr);
         const block = inputRegisterBlock(m);
         if (n < 0 || n >= block.length) return reject(new Error("Illegal input register " + addr));
+        logRead(m, "FC04", "InputReg", addr);
         resolve(block[n]);
       } catch (e) { reject(e); }
     }),
@@ -178,17 +216,25 @@ const vector = {
         const m = meterByUnit(unitID);
         const n = normHolding(addr);
         if (n < 0 || n >= m.holding.length) return reject(new Error("Illegal holding register " + addr));
+        logRead(m, "FC03", "HoldingReg", addr);
         resolve(m.holding[n]);
       } catch (e) { reject(e); }
     }),
   getCoil: (addr, unitID) =>
     new Promise((resolve, reject) => {
-      try { resolve(getCoilState(meterByUnit(unitID), addr)); } catch (e) { reject(e); }
+      try {
+        const m = meterByUnit(unitID);
+        const v = getCoilState(m, addr);
+        logRead(m, "FC01", "Coil", addr);
+        resolve(v);
+      } catch (e) { reject(e); }
     }),
   setCoil: (addr, value, unitID) =>
     new Promise((resolve, reject) => {
       try {
-        setCoilState(meterByUnit(unitID), addr, value);
+        const m = meterByUnit(unitID);
+        setCoilState(m, addr, value);
+        logWrite(m, "FC05", "Coil", addr, value ? 1 : 0);
         console.log(`[unit ${unitID}] coil ${addr} <- ${value ? 1 : 0}`);
         resolve();
       } catch (e) { reject(e); }
@@ -200,6 +246,7 @@ const vector = {
         const n = normHolding(addr);
         if (n < 0 || n >= m.holding.length) return reject(new Error("Illegal holding register " + addr));
         m.holding[n] = value & 0xffff;
+        logWrite(m, "FC16", "HoldingReg", addr, value);
         console.log(`[unit ${unitID}] holding ${addr} <- ${value}`);
         resolve();
       } catch (e) { reject(e); }
@@ -238,6 +285,7 @@ function meterState(m) {
     density: m.density,
     statusSensor: m.statusSensor,
     statusDevice: m.statusDevice,
+    logs: m.logs,
     holding: {
       flowDirection: m.holding[2000],
       pulseFilter: m.holding[2001],

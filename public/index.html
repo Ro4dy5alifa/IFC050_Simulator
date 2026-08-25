@@ -30,6 +30,8 @@
   details { margin-top: 8px; font-size: 12px; }
   summary { cursor: pointer; color: #8c99ad; }
   .hold td input { width: 80px; }
+  textarea.log { width: 100%; margin-top: 8px; background: #0c1016; border: 1px solid #2a3342; border-radius: 4px;
+    color: #8fd18f; font-family: Consolas, monospace; font-size: 11px; resize: vertical; padding: 6px; }
 </style>
 </head>
 <body>
@@ -112,7 +114,9 @@ function build() {
             <td><input type="number" step="any" id="h_${i}_${r[0]}"></td>
             <td><button onclick="setHolding(${i},${r[0]})">Set</button></td></tr>`).join("")}
         </table>
-      </details>`;
+      </details>
+      <label>Modbus client activity</label>
+      <textarea class="log" id="log${i}" rows="6" readonly></textarea>`;
     main.appendChild(c);
     document.getElementById("sl" + i).addEventListener("input", e => {
       document.getElementById("sp" + i).value = e.target.value;
@@ -178,6 +182,13 @@ async function refresh() {
       for (const [addr, key] of Object.entries(HOLD_MAP)) {
         const el = document.getElementById(`h_${i}_${addr}`);
         if (el && document.activeElement !== el) el.value = m.holding[key];
+      }
+      const logEl = document.getElementById("log" + i);
+      const text = m.logs.join("\n");
+      if (logEl.value !== text) {
+        const stuck = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 20;
+        logEl.value = text;
+        if (stuck) logEl.scrollTop = logEl.scrollHeight;
       }
     }
   } catch (e) { /* retry next tick */ }
