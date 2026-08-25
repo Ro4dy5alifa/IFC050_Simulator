@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>IFC050 Flowmeter Simulator</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: "Segoe UI", Arial, sans-serif; background: #12161c; color: #d7dde6; }
+  header { padding: 12px 20px; background: #1b2230; border-bottom: 1px solid #2a3342; display: flex; align-items: baseline; gap: 16px; }
+  header h1 { font-size: 18px; margin: 0; }
+  header span { color: #7f8ba0; font-size: 13px; }
+  main { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 16px; padding: 16px 20px; }
+  .card { background: #1b2230; border: 1px solid #2a3342; border-radius: 8px; padding: 14px 16px; }
+  .card h2 { margin: 0 0 4px; font-size: 16px; display: flex; justify-content: space-between; align-items: center; }
+  .badge { font-size: 11px; padding: 2px 8px; border-radius: 10px; background: #23406b; color: #9ec2ff; }
+  .badge.err { background: #6b2323; color: #ff9e9e; }
+  .badge.warn { background: #6b5a23; color: #ffe39e; }
+  .row { display: flex; gap: 10px; align-items: center; margin: 8px 0; flex-wrap: wrap; }
+  label { font-size: 12px; color: #8c99ad; }
+  input[type=number] { width: 90px; background: #12161c; border: 1px solid #2a3342; color: #d7dde6; border-radius: 4px; padding: 4px 6px; }
+  input[type=range] { flex: 1; min-width: 120px; }
+  button { background: #23406b; border: 1px solid #30507f; color: #cfe1ff; border-radius: 4px; padding: 4px 10px; font-size: 12px; cursor: pointer; }
+  button:hover { background: #2b4f83; }
+  button.on { background: #1e5b34; border-color: #2e7a4a; color: #b9f5cd; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 6px; }
+  td, th { border: 1px solid #2a3342; padding: 3px 6px; text-align: right; }
+  th { text-align: left; color: #8c99ad; font-weight: normal; }
+  .vals td:first-child { text-align: left; color: #8c99ad; }
+  details { margin-top: 8px; font-size: 12px; }
+  summary { cursor: pointer; color: #8c99ad; }
+  .hold td input { width: 80px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Krohne IFC050 Simulator</h1>
+  <span>Modbus TCP port 502 &middot; Unit IDs 1-3</span>
+</header>
+<main id="cards"></main>
+
+<script>
+const main = document.getElementById("cards");
+let state = null;
+
+function fmt(v, d = 3) { return Number(v).toFixed(d); }
+
+async function api(url, body) {
+  const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+  return r.json();
+}
+
+function build() {
+  main.innerHTML = "";
+  for (let i = 1; i <= 3; i++) {
+    const c = document.createElement("div");
+    c.className = "card";
+    c.id = "m" + i;
+    c.innerHTML = `
+      <h2>Flowmeter ${i} <span class="badge" id="b${i}">OK</span></h2>
+      <div class="row">
+        <label>Flow setpoint [m/s]</label>
+        <input type="range" id="sl${i}" min="0" max="12" step="0.01" value="0">
+        <input type="number" id="sp${i}" min="0" max="12" step="0.01" value="0">
+      </div>
+      <div class="row">
+        <label>Pipe &Oslash; [mm]</label><input type="number" id="dm${i}" step="1" style="width:70px">
+        <label>Density [kg/m&sup3;]</label><input type="number" id="dn${i}" step="1" style="width:80px">
+        <button onclick="applyGeo(${i})">Apply</button>
+      </div>
+      <table class="vals">
+        <tr><td>Flow speed</td><td id="vs${i}">-</td><td>m/s</td></tr>
+        <tr><td>Volume flow</td><td id="vv${i}">-</td><td>m&sup3;/s</td></tr>
+        <tr><td>Volume flow</td><td id="vh${i}">-</td><td>m&sup3;/h</td></tr>
+        <tr><td>Mass flow</td><td id="vm${i}">-</td><td>kg/s</td></tr>
+        <tr><td>Operating time</td><td id="vo${i}">-</td><td>h</td></tr>
+        <tr><td>Counter 1</td><td id="c1${i}">-</td><td>m&sup3;</td></tr>
+        <tr><td>Counter 2</td><td id="c2${i}">-</td><td>m&sup3;</td></tr>
+        <tr><td>Status sensor / device</td><td id="st${i}">-</td><td>hex</td></tr>
+      </table>
+      <div class="row">
+        <label>Counter 1</label>
+        <button id="c1s${i}" onclick="counter(${i},1,'start')">Start</button>
+        <button id="c1t${i}" onclick="counter(${i},1,'stop')">Stop</button>
+        <button onclick="counter(${i},1,'reset')">Reset</button>
+      </div>
+      <div class="row">
+        <label>Counter 2</label>
+        <button id="c2s${i}" onclick="counter(${i},2,'start')">Start</button>
+        <button id="c2t${i}" onclick="counter(${i},2,'stop')">Stop</button>
+        <button onclick="counter(${i},2,'reset')">Reset</button>
+      </div>
+      <div class="row">
+        <button id="ep${i}" onclick="toggleFlag(${i},'emptyPipe')">Empty pipe</button>
+        <button id="er${i}" onclick="toggleFlag(${i},'error')">Device error</button>
+      </div>
+      <details>
+        <summary>Holding registers (FC03/FC16)</summary>
+        <table class="hold">
+          <tr><th>Addr</th><th>Parameter</th><th>Value</th><th></th></tr>
+          ${[
+            [2000,"Flow direction (0=normal,1=reverse)","flowDirection",1],
+            [2001,"Pulse filter","pulseFilter",1],
+            [2002,"Empty pipe mode","emptyPipeMode",1],
+            [3000,"Limitation low [m/s]","limitationLow",0],
+            [3002,"Limitation high [m/s]","limitationHigh",0],
+            [3004,"Time constant [s]","timeConstant",0],
+            [3012,"Low flow cutoff [m/s]","lowFlowCutoff",0],
+            [3016,"Zero point [m/s]","zeroPoint",0],
+            [3018,"Electrode factor EF [m]","electrodeFactor",0]
+          ].map(r => `<tr><td>${r[0]}</td><td style="text-align:left">${r[1]}</td>
+            <td><input type="number" step="any" id="h_${i}_${r[0]}"></td>
+            <td><button onclick="setHolding(${i},${r[0]})">Set</button></td></tr>`).join("")}
+        </table>
+      </details>`;
+    main.appendChild(c);
+    document.getElementById("sl" + i).addEventListener("input", e => {
+      document.getElementById("sp" + i).value = e.target.value;
+      api(`/api/meter/${i}`, { flowSpeed: Number(e.target.value) });
+    });
+    document.getElementById("sp" + i).addEventListener("change", e => {
+      document.getElementById("sl" + i).value = e.target.value;
+      api(`/api/meter/${i}`, { flowSpeed: Number(e.target.value) });
+    });
+  }
+}
+
+function applyGeo(i) {
+  api(`/api/meter/${i}`, {
+    pipeDiamMm: Number(document.getElementById("dm" + i).value),
+    density: Number(document.getElementById("dn" + i).value)
+  });
+}
+
+function counter(i, n, action) { api(`/api/meter/${i}/counter/${n}`, { action }); }
+
+function toggleFlag(i, flag) {
+  const m = state.meters[i - 1];
+  api(`/api/meter/${i}`, { [flag]: !m[flag] });
+}
+
+function setHolding(i, addr) {
+  api(`/api/meter/${i}/holding`, { addr, value: Number(document.getElementById(`h_${i}_${addr}`).value) });
+}
+
+const HOLD_MAP = { 2000:"flowDirection", 2001:"pulseFilter", 2002:"emptyPipeMode", 3000:"limitationLow",
+  3002:"limitationHigh", 3004:"timeConstant", 3012:"lowFlowCutoff", 3016:"zeroPoint", 3018:"electrodeFactor" };
+
+function hex(v) { return "0x" + (v >>> 0).toString(16).padStart(8, "0"); }
+
+async function refresh() {
+  try {
+    state = await (await fetch("/api/state")).json();
+    for (const m of state.meters) {
+      const i = m.id;
+      const b = document.getElementById("b" + i);
+      if (m.error) { b.textContent = "ERROR"; b.className = "badge err"; }
+      else if (m.emptyPipe) { b.textContent = "EMPTY PIPE"; b.className = "badge warn"; }
+      else { b.textContent = "OK"; b.className = "badge"; }
+      if (document.activeElement !== document.getElementById("sp" + i)) {
+        document.getElementById("sp" + i).value = fmt(m.targetSpeed, 2);
+        document.getElementById("sl" + i).value = m.targetSpeed;
+      }
+      if (document.activeElement !== document.getElementById("dm" + i)) document.getElementById("dm" + i).value = m.pipeDiamMm;
+      if (document.activeElement !== document.getElementById("dn" + i)) document.getElementById("dn" + i).value = m.density;
+      document.getElementById("vs" + i).textContent = fmt(m.flowSpeed, 3);
+      document.getElementById("vv" + i).textContent = fmt(m.volumeFlow, 5);
+      document.getElementById("vh" + i).textContent = fmt(m.volumeFlowM3h, 2);
+      document.getElementById("vm" + i).textContent = fmt(m.massFlow, 3);
+      document.getElementById("vo" + i).textContent = fmt(m.operatingTime / 3600, 4);
+      document.getElementById("c1" + i).textContent = fmt(m.counter1, 3);
+      document.getElementById("c2" + i).textContent = fmt(m.counter2, 3);
+      document.getElementById("st" + i).textContent = hex(m.statusSensor) + " / " + hex(m.statusDevice);
+      document.getElementById("c1s" + i).className = m.c1run ? "on" : "";
+      document.getElementById("c2s" + i).className = m.c2run ? "on" : "";
+      document.getElementById("ep" + i).className = m.emptyPipe ? "on" : "";
+      document.getElementById("er" + i).className = m.error ? "on" : "";
+      for (const [addr, key] of Object.entries(HOLD_MAP)) {
+        const el = document.getElementById(`h_${i}_${addr}`);
+        if (el && document.activeElement !== el) el.value = m.holding[key];
+      }
+    }
+  } catch (e) { /* retry next tick */ }
+}
+
+build();
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
