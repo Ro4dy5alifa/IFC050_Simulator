@@ -64,6 +64,10 @@ function makeMeter(id) {
     holding,
     targetSpeed: 0.0,
     filtSpeed: 0.0,
+    vary: false,
+    varyPct: 5,
+    varyOffset: 0,
+    varyNext: 0,
     dispSpeed: 0.0,
     dispVol: 0.0,
     dispMass: 0.0,
@@ -143,7 +147,17 @@ setInterval(() => {
   lastTick = now;
   for (const m of meters) {
     const tau = Math.max(readFloatBE(m.holding, 3004), 0.05);
-    m.filtSpeed += (m.targetSpeed - m.filtSpeed) * Math.min(dt / tau, 1);
+    let target = m.targetSpeed;
+    if (m.vary) {
+      if (now >= m.varyNext) {
+        m.varyOffset = (Math.random() * 2 - 1) * (m.varyPct / 100);
+        m.varyNext = now + 2000;
+      }
+      target *= 1 + m.varyOffset;
+    } else {
+      m.varyOffset = 0;
+    }
+    m.filtSpeed += (target - m.filtSpeed) * Math.min(dt / tau, 1);
     computeOutputs(m);
     m.operatingTime += dt;
     if (m.c1run) m.counter1 += m.dispVol * dt;
@@ -358,6 +372,8 @@ function meterState(m) {
   return {
     id: m.id,
     targetSpeed: m.targetSpeed,
+    vary: m.vary,
+    varyPct: m.varyPct,
     flowSpeed: m.dispSpeed,
     volumeFlow: m.dispVol,
     volumeFlowM3h: m.dispVol * 3600,
@@ -404,6 +420,8 @@ app.post("/api/meter/:id", (req, res) => {
   if (!m) return res.status(404).json({ error: "unknown meter" });
   const b = req.body || {};
   if (typeof b.flowSpeed === "number") m.targetSpeed = b.flowSpeed;
+  if (typeof b.vary === "boolean") m.vary = b.vary;
+  if (typeof b.varyPct === "number" && b.varyPct >= 0 && b.varyPct <= 100) m.varyPct = b.varyPct;
   if (typeof b.emptyPipe === "boolean") m.emptyPipe = b.emptyPipe;
   if (typeof b.error === "boolean") m.error = b.error;
   if (typeof b.pipeDiamMm === "number" && b.pipeDiamMm > 0) m.pipeDiamMm = b.pipeDiamMm;

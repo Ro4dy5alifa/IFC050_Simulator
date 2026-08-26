@@ -73,6 +73,11 @@ function build() {
         <input type="number" id="sp${i}" min="0" max="12" step="0.01" value="0">
       </div>
       <div class="row">
+        <label><input type="checkbox" id="vary${i}" onchange="setVary(${i})"> Vary flow &plusmn;</label>
+        <input type="number" id="vp${i}" min="0" max="100" step="0.1" value="5" style="width:70px" onchange="setVary(${i})">
+        <label>%</label>
+      </div>
+      <div class="row">
         <label>Pipe &Oslash; [mm]</label><input type="number" id="dm${i}" step="1" style="width:70px">
         <label>Density [kg/m&sup3;]</label><input type="number" id="dn${i}" step="1" style="width:80px">
         <button onclick="applyGeo(${i})">Apply</button>
@@ -154,6 +159,13 @@ function applyGeo(i) {
 
 function counter(i, n, action) { api(`/api/meter/${i}/counter/${n}`, { action }); }
 
+function setVary(i) {
+  api(`/api/meter/${i}`, {
+    vary: document.getElementById("vary" + i).checked,
+    varyPct: Number(document.getElementById("vp" + i).value)
+  });
+}
+
 function toggleFlag(i, flag) {
   const m = state.meters[i - 1];
   api(`/api/meter/${i}`, { [flag]: !m[flag] });
@@ -183,6 +195,8 @@ async function refresh() {
       }
       if (document.activeElement !== document.getElementById("dm" + i)) document.getElementById("dm" + i).value = m.pipeDiamMm;
       if (document.activeElement !== document.getElementById("dn" + i)) document.getElementById("dn" + i).value = m.density;
+      document.getElementById("vary" + i).checked = m.vary;
+      if (document.activeElement !== document.getElementById("vp" + i)) document.getElementById("vp" + i).value = m.varyPct;
       document.getElementById("vs" + i).textContent = fmt(m.flowSpeed, 3);
       document.getElementById("vv" + i).textContent = fmt(m.volumeFlow, 5);
       document.getElementById("vh" + i).textContent = fmt(m.volumeFlowM3h, 2);
