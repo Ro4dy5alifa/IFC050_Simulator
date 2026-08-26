@@ -1,4 +1,5 @@
 require("dotenv").config();
+const fs = require("fs");
 const path = require("path");
 const net = require("net");
 const express = require("express");
@@ -117,6 +118,70 @@ function logWrite(m, fc, label, addr, value) {
 
 const meters = [];
 for (let i = 1; i <= METER_COUNT; i++) meters.push(makeMeter(i));
+
+const SAVE_FILE = path.join(__dirname, "simulator-state.json");
+
+function saveState() {
+  try {
+    const data = meters.map(m => ({
+      targetSpeed: m.targetSpeed,
+      vary: m.vary,
+      varyPct: m.varyPct,
+      pipeDiamMm: m.pipeDiamMm,
+      density: m.density,
+      c1run: m.c1run,
+      c2run: m.c2run,
+      emptyPipe: m.emptyPipe,
+      error: m.error,
+      wordOrder: m.wordOrder,
+      counter1: m.counter1,
+      counter2: m.counter2,
+      operatingTime: m.operatingTime,
+      holding: Array.from(m.holding)
+    }));
+    fs.writeFileSync(SAVE_FILE, JSON.stringify(data));
+  } catch (e) {
+    console.error("state save failed:", e.message);
+  }
+}
+
+function loadState() {
+  try {
+    if (!fs.existsSync(SAVE_FILE)) return;
+    const data = JSON.parse(fs.readFileSync(SAVE_FILE, "utf8"));
+    if (!Array.isArray(data)) return;
+    data.forEach((d, i) => {
+      const m = meters[i];
+      if (!m || !d) return;
+      if (typeof d.targetSpeed === "number") m.targetSpeed = d.targetSpeed;
+      if (typeof d.vary === "boolean") m.vary = d.vary;
+      if (typeof d.varyPct === "number") m.varyPct = d.varyPct;
+      if (typeof d.pipeDiamMm === "number") m.pipeDiamMm = d.pipeDiamMm;
+      if (typeof d.density === "number") m.density = d.density;
+      if (typeof d.c1run === "boolean") m.c1run = d.c1run;
+      if (typeof d.c2run === "boolean") m.c2run = d.c2run;
+      if (typeof d.emptyPipe === "boolean") m.emptyPipe = d.emptyPipe;
+      if (typeof d.error === "boolean") m.error = d.error;
+      if (typeof d.wordOrder === "string") m.wordOrder = d.wordOrder;
+      if (typeof d.counter1 === "number") m.counter1 = d.counter1;
+      if (typeof d.counter2 === "number") m.counter2 = d.counter2;
+      if (typeof d.operatingTime === "number") m.operatingTime = d.operatingTime;
+      if (Array.isArray(d.holding)) {
+        const n = Math.min(d.holding.length, m.holding.length);
+        for (let j = 0; j < n; j++) m.holding[j] = d.holding[j] & 0xffff;
+      }
+    });
+    console.log(`restored state from ${SAVE_FILE}`);
+  } catch (e) {
+    console.error("state load failed:", e.message);
+  }
+}
+
+loadState();
+process.on("SIGINT", () => { saveState(); process.exit(0); });
+process.on("SIGTERM", () => { saveState(); process.exit(0); });
+process.on("exit", () => saveState());
+setInterval(saveState, 5000).unref();
 
 function computeOutputs(m) {
   const limLo = readFloatBE(m.holding, 3000);
