@@ -201,8 +201,11 @@ function computeOutputs(m) {
   m.dispVol = m.dispSpeed * area;
   m.dispMass = m.dispVol * m.density;
 
-  m.statusSensor = m.emptyPipe ? 0x00000001 : 0;
-  m.statusDevice = m.error ? 0x00000001 : 0;
+  // IFC050 manual bit layout, u32 big-endian (ABCD): u32 bit = (3 - byte) * 8 + bit-in-byte
+  m.statusSensor = 0;
+  if (m.emptyPipe) m.statusSensor |= (1 << 18);   // byte 1 bit 2: Empty pipe (F)
+  if (m.dispSpeed < 0) m.statusSensor |= (1 << 20); // byte 1 bit 4: Flow sign (negative flow)
+  m.statusDevice = m.error ? 0x80000000 : 0;        // byte 0 bit 7: Error in device
 }
 
 let lastTick = Date.now();
