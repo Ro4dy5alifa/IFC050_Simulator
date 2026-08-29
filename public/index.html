@@ -31,6 +31,14 @@
   details { margin-top: 8px; font-size: 12px; }
   summary { cursor: pointer; color: #8c99ad; }
   .hold td input { width: 80px; }
+  .flag { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 9px; margin: 2px 3px 2px 0; border: 1px solid #2a3342; }
+  .flag.error { background: #6b2323; color: #ff9e9e; border-color: #8a3535; }
+  .flag.warning { background: #6b5a23; color: #ffe39e; border-color: #8a7535; }
+  .flag.info { background: #23406b; color: #9ec2ff; border-color: #30507f; }
+  .flag.unknown { background: #3a3a3a; color: #bbb; }
+  .stbits { font-family: Consolas, monospace; font-size: 11px; color: #8c99ad; }
+  .bitcb label { color: #d7dde6; font-size: 11px; display: block; margin: 2px 0; }
+  .bitcb h4 { margin: 8px 0 2px; font-size: 12px; color: #8c99ad; font-weight: normal; }
   textarea.log { width: 100%; margin-top: 8px; background: #0c1016; border: 1px solid #2a3342; border-radius: 4px;
     color: #8fd18f; font-family: Consolas, monospace; font-size: 11px; resize: vertical; padding: 6px; }
 </style>
@@ -99,8 +107,17 @@ function build() {
         <tr><td>Operating time</td><td id="vo${i}">-</td><td>h</td></tr>
         <tr><td>Counter 1</td><td id="c1${i}">-</td><td>m&sup3;</td></tr>
         <tr><td>Counter 2</td><td id="c2${i}">-</td><td>m&sup3;</td></tr>
-        <tr><td>Status sensor / device</td><td id="st${i}">-</td><td>hex</td></tr>
       </table>
+      <div class="row" style="display:block">
+        <div>Sensor (30016-17): <span class="stbits" id="ssb${i}"></span> <span id="ssx${i}"></span></div>
+        <div id="ssf${i}" style="margin:2px 0 6px"></div>
+        <div>Device (30018-19): <span class="stbits" id="dsb${i}"></span> <span id="dsx${i}"></span></div>
+        <div id="dsf${i}" style="margin:2px 0 2px"></div>
+      </div>
+      <details>
+        <summary>Status bits (manual)</summary>
+        <div class="bitcb" id="sbits${i}"></div>
+      </details>
       <div class="row">
         <label>Counter 1</label>
         <button id="c1s${i}" onclick="counter(${i},1,'start')">Start</button>
@@ -139,6 +156,7 @@ function build() {
       <label>Modbus client activity</label>
       <textarea class="log" id="log${i}" rows="6" readonly></textarea>`;
     main.appendChild(c);
+    buildBitBoxes(i);
     document.getElementById("sl" + i).addEventListener("input", e => {
       document.getElementById("sp" + i).value = e.target.value;
       api(`/api/meter/${i}`, { flowSpeed: Number(e.target.value) });
@@ -180,14 +198,55 @@ const HOLD_MAP = { 2000:"flowDirection", 2001:"pulseFilter", 2002:"emptyPipeMode
 
 function hex(v) { return "0x" + (v >>> 0).toString(16).padStart(8, "0"); }
 
+const SENSOR_MANUAL_BITS = [
+  ["fatalError", "Fatal error in sensor electronic (B0.7)"],
+  ["appError", "Application error (B0.6)"],
+  ["outOfSpec", "Out of specification (B0.5)"],
+  ["flowOverRange", "Flow over range (B0.1)"],
+  ["emptyPipeS", "Empty pipe (S) (B2.7)"],
+  ["emptyPipeI", "Empty pipe (I) (B2.4)"],
+  ["coilTemp", "Coil temperature out of range (B3.4)"],
+  ["gainError", "Gain error (B3.1)"]
+];
+const DEVICE_MANUAL_BITS = [
+  ["appError", "Application error (B0.6)"],
+  ["uncertain", "Uncertain measurement (B0.5)"],
+  ["checks", "Checks in progress (B0.4)"]
+];
+
+function buildBitBoxes(i) {
+  const el = document.getElementById("sbits" + i);
+  const group = (title, kind, defs) => `
+    <h4>${title}</h4>
+    ${defs.map(([key, label]) => `<label><input type="checkbox" id="sb_${i}_${kind}_${key}"
+      onchange="setStatusBit(${i},'${kind}','${key}',this.checked)"> ${label}</label>`).join("")}
+  `;
+  el.innerHTML = group("Sensor status", "sensor", SENSOR_MANUAL_BITS) + group("Device status", "device", DEVICE_MANUAL_BITS)
+    + `<h4>Auto-derived (not settable here)</h4>
+       <div style="font-size:11px;color:#8c99ad">Sensor: Flow sign (B1.4) from negative flow, Empty pipe (F) (B1.2) from Empty pipe toggle, Flow over range (B0.1) when flow exceeds limitation high.<br>
+       Device: Error in device (B0.7) from Device error toggle.</div>`;
+}
+
+function setStatusBit(i, kind, key, on) {
+  api(`/api/meter/${i}`, { [kind === "sensor" ? "sensorBits" : "deviceBits"]: { [key]: on } });
+}
+
+function renderFlags(el, d) {
+  const flags = d.active.map(a => `<span class="flag ${a.severity}" title="${a.bit} — ${a.description}">${a.message}</span>`).join("");
+  const unk = d.unknown.map(u => `<span class="flag unknown" title="undocumented bit">${u} unknown</span>`).join("");
+  el.innerHTML = flags + unk || '<span style="color:#6fbf73;font-size:11px">OK</span>';
+}
+
 async function refresh() {
   try {
     state = await (await fetch("/api/state")).json();
     for (const m of state.meters) {
       const i = m.id;
       const b = document.getElementById("b" + i);
-      if (m.error) { b.textContent = "ERROR"; b.className = "badge err"; }
-      else if (m.emptyPipe) { b.textContent = "EMPTY PIPE"; b.className = "badge warn"; }
+      const sev = m.statusDeviceDecoded.severity === "error" || m.statusSensorDecoded.severity === "error" ? "error"
+        : (m.statusDeviceDecoded.severity === "warning" || m.statusSensorDecoded.severity === "warning" ? "warning" : "ok");
+      if (sev === "error") { b.textContent = "ERROR"; b.className = "badge err"; }
+      else if (sev === "warning") { b.textContent = "WARNING"; b.className = "badge warn"; }
       else { b.textContent = "OK"; b.className = "badge"; }
       if (document.activeElement !== document.getElementById("sp" + i)) {
         document.getElementById("sp" + i).value = fmt(m.targetSpeed, 2);
@@ -203,8 +262,23 @@ async function refresh() {
       document.getElementById("vm" + i).textContent = fmt(m.massFlow, 3);
       document.getElementById("vo" + i).textContent = fmt(m.operatingTime / 3600, 4);
       document.getElementById("c1" + i).textContent = fmt(m.counter1, 3);
-      document.getElementById("c2" + i).textContent = fmt(m.counter2, 3);
-      document.getElementById("st" + i).textContent = hex(m.statusSensor) + " / " + hex(m.statusDevice);
+      const c = document.getElementById("c2" + i);
+      c.textContent = fmt(m.counter2, 3);
+      const ssd = m.statusSensorDecoded, dsd = m.statusDeviceDecoded;
+      document.getElementById("ssb" + i).textContent = ssd.bits;
+      document.getElementById("ssx" + i).textContent = ssd.hex;
+      document.getElementById("dsb" + i).textContent = dsd.bits;
+      document.getElementById("dsx" + i).textContent = dsd.hex;
+      renderFlags(document.getElementById("ssf" + i), ssd);
+      renderFlags(document.getElementById("dsf" + i), dsd);
+      for (const [key] of SENSOR_MANUAL_BITS) {
+        const cb = document.getElementById(`sb_${i}_sensor_${key}`);
+        if (cb && cb.checked !== !!m.sensorBits[key]) cb.checked = !!m.sensorBits[key];
+      }
+      for (const [key] of DEVICE_MANUAL_BITS) {
+        const cb = document.getElementById(`sb_${i}_device_${key}`);
+        if (cb && cb.checked !== !!m.deviceBits[key]) cb.checked = !!m.deviceBits[key];
+      }
       document.getElementById("c1s" + i).className = m.c1run ? "on" : "";
       document.getElementById("c2s" + i).className = m.c2run ? "on" : "";
       document.getElementById("ep" + i).className = m.emptyPipe ? "on" : "";
