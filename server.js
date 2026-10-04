@@ -11,6 +11,76 @@ const WEB_PORT = Number(process.env.WEB_PORT || 8081);
 const METER_COUNT = 3;
 const TICK_MS = 100;
 
+// IFC050 status bit positions in the u32 (ABCD): u32 bit = (3 - byte) * 8 + bit-in-byte
+// Manual-toggleable bits per meter; flowSign / emptyPipeF / device error are auto-derived.
+const SENSOR_BIT_POS = {
+  fatalError: 31,      // byte 0 bit 7: Fatal error in sensor electronic
+  appError: 30,        // byte 0 bit 6: Application error
+  outOfSpec: 29,       // byte 0 bit 5: Out of specification
+  flowOverRange: 25,   // byte 0 bit 1: Flow over range
+  flowSign: 20,        // byte 1 bit 4: Flow sign (auto: negative flow)
+  emptyPipeF: 18,      // byte 1 bit 2: Empty pipe (F) (auto from emptyPipe flag)
+  emptyPipeS: 15,      // byte 2 bit 7: Empty pipe (S)
+  emptyPipeI: 12,      // byte 2 bit 4: Empty pipe (I)
+  coilTemp: 4,         // byte 3 bit 4: Coil temperature out of range
+  gainError: 1         // byte 3 bit 1: Gain error
+};
+
+const DEVICE_BIT_POS = {
+  error: 31,           // byte 0 bit 7: Error in device (auto from error flag)
+  appError: 30,        // byte 0 bit 6: Application error
+  uncertain: 29,       // byte 0 bit 5: Uncertain measurement
+  checks: 28           // byte 0 bit 4: Checks in progress
+};
+
+const SENSOR_BIT_TABLE = [
+  { key: "fatalError", pos: 31, bit: "B0.7", message: "Fatal error in sensor electronic", description: "Error or failure of the sensor electronic, parameter or hardware error, this cannot be used any longer.", severity: "error" },
+  { key: "appError", pos: 30, bit: "B0.6", message: "Application error", description: "Application error has occurred, the measuring device is however ok, the measured values are not valid", severity: "warning" },
+  { key: "outOfSpec", pos: 29, bit: "B0.5", message: "Out of specification", description: "Maintenance required, measured value restrictedly usable", severity: "warning" },
+  { key: "flowOverRange", pos: 25, bit: "B0.1", message: "Flow over range", description: "Over range, the measured values are limited by the filter setting.", severity: "warning" },
+  { key: "flowSign", pos: 20, bit: "B1.4", message: "Flow sign", description: "1 = negative flow", severity: "info" },
+  { key: "emptyPipeF", pos: 18, bit: "B1.2", message: "Empty pipe (F)", description: "One or both measuring electrodes have no contact for fluidity, flow measured value is set to zero, no flow measurement possible", severity: "warning" },
+  { key: "emptyPipeS", pos: 15, bit: "B2.7", message: "Empty pipe (S)", description: "One or both measuring electrodes have no contact for fluidity, flow measured value is set to zero, no flow measurement possible", severity: "warning" },
+  { key: "emptyPipeI", pos: 12, bit: "B2.4", message: "Empty pipe (I)", description: "One or both measuring electrodes have no contact for fluidity, flow measured value is set to zero, no flow measurement possible", severity: "warning" },
+  { key: "coilTemp", pos: 4, bit: "B3.4", message: "Coil temperature out of range", description: "The maximum coil temperature is exceeded, no message if coil bridged or broken.", severity: "warning" },
+  { key: "gainError", pos: 1, bit: "B3.1", message: "Gain error", description: "The preamplifier gain does not correspond to the calibrated value, calibration check, flow measured values are provided further on", severity: "warning" }
+];
+
+const DEVICE_BIT_TABLE = [
+  { key: "error", pos: 31, bit: "B0.7", message: "Error in device", description: "Error or failure of the complete device, parameter or hardware error, device cannot be used any longer.", severity: "error" },
+  { key: "appError", pos: 30, bit: "B0.6", message: "Application error", description: "Application-contingent error of the complete device, the device is however in order", severity: "warning" },
+  { key: "uncertain", pos: 29, bit: "B0.5", message: "Uncertain measurement", description: "Maintenance of the device necessary, measured values only conditionally usable.", severity: "warning" },
+  { key: "checks", pos: 28, bit: "B0.4", message: "Checks in progress", description: "Test run of the device, measured values can be simulated measured values or be set to a fixed value.", severity: "info" }
+];
+
+function decodeStatus(value, table) {
+  const v = Number(value) >>> 0;
+  const bytes = [(v >>> 24) & 0xff, (v >>> 16) & 0xff, (v >>> 8) & 0xff, v & 0xff];
+  const active = [];
+  const unknown = [];
+  for (let b = 0; b < 4; b++) {
+    for (let bit = 7; bit >= 0; bit--) {
+      if (!(bytes[b] & (1 << bit))) continue;
+      const pos = (3 - b) * 8 + bit;
+      const def = table.find(t => t.pos === pos);
+      if (def) active.push({ bit: `B${b}.${bit}`, message: def.message, description: def.description, severity: def.severity });
+      else unknown.push(`B${b}.${bit}`);
+    }
+  }
+  let severity = "ok";
+  if (active.some(a => a.severity === "error")) severity = "error";
+  else if (active.some(a => a.severity === "warning")) severity = "warning";
+  else if (active.length || unknown.length) severity = "info";
+  return {
+    value: v,
+    hex: "0x" + v.toString(16).padStart(8, "0").toUpperCase(),
+    bits: bytes.map(b => b.toString(2).padStart(8, "0")).join(" "),
+    active,
+    unknown,
+    severity
+  };
+}
+
 function writeFloatBE(arr, idx, val) {
   const b = Buffer.alloc(4);
   b.writeFloatBE(val, 0);
@@ -81,6 +151,8 @@ function makeMeter(id) {
     c2run: false,
     emptyPipe: false,
     error: false,
+    sensorBits: {},
+    deviceBits: {},
     statusSensor: 0,
     statusDevice: 0,
     wordOrder: "ABCD",
@@ -133,6 +205,8 @@ function saveState() {
       c2run: m.c2run,
       emptyPipe: m.emptyPipe,
       error: m.error,
+      sensorBits: m.sensorBits,
+      deviceBits: m.deviceBits,
       wordOrder: m.wordOrder,
       counter1: m.counter1,
       counter2: m.counter2,
@@ -162,6 +236,12 @@ function loadState() {
       if (typeof d.c2run === "boolean") m.c2run = d.c2run;
       if (typeof d.emptyPipe === "boolean") m.emptyPipe = d.emptyPipe;
       if (typeof d.error === "boolean") m.error = d.error;
+      if (d.sensorBits && typeof d.sensorBits === "object") {
+        for (const k of Object.keys(SENSOR_BIT_POS)) m.sensorBits[k] = !!d.sensorBits[k];
+      }
+      if (d.deviceBits && typeof d.deviceBits === "object") {
+        for (const k of Object.keys(DEVICE_BIT_POS)) m.deviceBits[k] = !!d.deviceBits[k];
+      }
       if (typeof d.wordOrder === "string") m.wordOrder = d.wordOrder;
       if (typeof d.counter1 === "number") m.counter1 = d.counter1;
       if (typeof d.counter2 === "number") m.counter2 = d.counter2;
@@ -202,10 +282,23 @@ function computeOutputs(m) {
   m.dispMass = m.dispVol * m.density;
 
   // IFC050 manual bit layout, u32 big-endian (ABCD): u32 bit = (3 - byte) * 8 + bit-in-byte
-  m.statusSensor = 0;
-  if (m.emptyPipe) m.statusSensor |= (1 << 18);   // byte 1 bit 2: Empty pipe (F)
-  if (m.dispSpeed < 0) m.statusSensor |= (1 << 20); // byte 1 bit 4: Flow sign (negative flow)
-  m.statusDevice = m.error ? 0x80000000 : 0;        // byte 0 bit 7: Error in device
+  let ss = 0;
+  for (const [key, pos] of Object.entries(SENSOR_BIT_POS)) {
+    if (key === "flowSign" || key === "emptyPipeF") continue;
+    if (m.sensorBits[key]) ss |= (1 << pos);
+  }
+  if (m.emptyPipe) ss |= (1 << SENSOR_BIT_POS.emptyPipeF);
+  if (m.dispSpeed < 0) ss |= (1 << SENSOR_BIT_POS.flowSign);
+  if (limHi > 0 && Math.abs(m.filtSpeed) > limHi) ss |= (1 << SENSOR_BIT_POS.flowOverRange);
+  m.statusSensor = ss >>> 0;
+
+  let sd = 0;
+  for (const [key, pos] of Object.entries(DEVICE_BIT_POS)) {
+    if (key === "error") continue;
+    if (m.deviceBits[key]) sd |= (1 << pos);
+  }
+  if (m.error) sd |= (1 << DEVICE_BIT_POS.error);
+  m.statusDevice = sd >>> 0;
 }
 
 let lastTick = Date.now();
@@ -457,6 +550,10 @@ function meterState(m) {
     density: m.density,
     statusSensor: m.statusSensor,
     statusDevice: m.statusDevice,
+    statusSensorDecoded: decodeStatus(m.statusSensor, SENSOR_BIT_TABLE),
+    statusDeviceDecoded: decodeStatus(m.statusDevice, DEVICE_BIT_TABLE),
+    sensorBits: m.sensorBits,
+    deviceBits: m.deviceBits,
     wordOrder: m.wordOrder,
     logs: m.logs,
     holding: {
@@ -492,6 +589,18 @@ app.post("/api/meter/:id", (req, res) => {
   if (typeof b.varyPct === "number" && b.varyPct >= 0 && b.varyPct <= 100) m.varyPct = b.varyPct;
   if (typeof b.emptyPipe === "boolean") m.emptyPipe = b.emptyPipe;
   if (typeof b.error === "boolean") m.error = b.error;
+  if (b.sensorBits && typeof b.sensorBits === "object") {
+    for (const [k, v] of Object.entries(b.sensorBits)) {
+      if (k === "flowSign" || k === "emptyPipeF") continue; // auto-derived
+      if (k in SENSOR_BIT_POS) m.sensorBits[k] = !!v;
+    }
+  }
+  if (b.deviceBits && typeof b.deviceBits === "object") {
+    for (const [k, v] of Object.entries(b.deviceBits)) {
+      if (k === "error") continue; // auto-derived
+      if (k in DEVICE_BIT_POS) m.deviceBits[k] = !!v;
+    }
+  }
   if (typeof b.pipeDiamMm === "number" && b.pipeDiamMm > 0) m.pipeDiamMm = b.pipeDiamMm;
   if (typeof b.density === "number" && b.density > 0) m.density = b.density;
   if (typeof b.wordOrder === "string" && ["ABCD", "BADC", "CDAB", "DCBA"].includes(b.wordOrder)) m.wordOrder = b.wordOrder;
