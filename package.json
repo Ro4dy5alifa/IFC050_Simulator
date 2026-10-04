@@ -2,7 +2,7 @@
   "name": "ifc050-simulator",
   "version": "1.0.0",
   "private": true,
-  "description": "Krohne IFC050 flowmeter simulator (Modbus TCP) with web UI",
+  "description": "Flowmeter simulator (Modbus TCP) with web UI",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"

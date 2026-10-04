@@ -1,4 +1,4 @@
-# IFC050 Flowmeter Simulator
+# IFC050 Flowmeter Simulator fmnkcjfm
 
 A Node.js Modbus TCP simulator for the Krohne IFC050 electromagnetic flowmeter, with a web UI for live control. Designed for testing Modbus masters, SCADA gateways, and protocol converters without needing a physical flowmeter.
 
