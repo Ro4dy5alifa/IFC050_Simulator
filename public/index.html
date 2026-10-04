@@ -41,14 +41,58 @@
   .bitcb h4 { margin: 8px 0 2px; font-size: 12px; color: #8c99ad; font-weight: normal; }
   textarea.log { width: 100%; margin-top: 8px; background: #0c1016; border: 1px solid #2a3342; border-radius: 4px;
     color: #8fd18f; font-family: Consolas, monospace; font-size: 11px; resize: vertical; padding: 6px; }
+  header { flex-wrap: wrap; }
+  header .count { margin-left: auto; display: flex; gap: 6px; align-items: center; }
+  input[type=text] { background: #12161c; border: 1px solid #2a3342; color: #d7dde6; border-radius: 4px; padding: 4px 6px; font-size: 12px; }
+  .overview { padding: 16px 20px 0; }
+  .ovbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 6px; }
+  .ovscroll { max-height: 340px; overflow: auto; border: 1px solid #2a3342; border-radius: 4px; }
+  .ovscroll table { margin: 0; }
+  .ovscroll th { position: sticky; top: 0; background: #1b2230; text-align: right; }
+  .ovscroll th:first-child, .ovscroll td:first-child { text-align: left; }
+  .ovscroll tr { cursor: pointer; }
+  .ovscroll tbody tr:hover { background: #222b3a; }
+  .ovscroll tr.open { background: #1d2f4a; }
+  .sev { font-size: 11px; padding: 1px 7px; border-radius: 9px; }
+  .sev.ok { color: #6fbf73; }
+  .sev.warning { background: #6b5a23; color: #ffe39e; }
+  .sev.error { background: #6b2323; color: #ff9e9e; }
+  .muted { color: #7f8ba0; font-size: 12px; }
+  .close { background: none; border: none; color: #7f8ba0; font-size: 16px; padding: 0 4px; }
+  .close:hover { background: none; color: #ff9e9e; }
+  #empty { padding: 0 20px; }
 </style>
 </head>
 <body>
 <header>
   <h1>Flowmeter Simulator</h1>
-  <span>Modbus TCP port 502 &middot; Unit IDs 1-3 &middot; UI port 8081</span>
+  <span id="endpoints">Modbus TCP port 502 &middot; UI port 8081</span>
+  <div class="count">
+    <label for="meterCount">Number of flowmeters</label>
+    <input type="number" id="meterCount" min="1" step="1" style="width:80px">
+    <button onclick="setCount()">Apply</button>
+  </div>
 </header>
+<section class="overview">
+  <div class="card">
+    <h2>All flowmeters <span class="muted" id="ovinfo"></span></h2>
+    <div class="ovbar">
+      <label>Show</label>
+      <input type="text" id="filter" placeholder="e.g. 1-20, 45 &middot; or: error, warning" style="width:230px" oninput="renderTable()">
+      <button onclick="openFiltered()">Open shown (max 12)</button>
+      <button onclick="closeAll()">Close all cards</button>
+      <span class="muted">Click a row to open or close that meter's settings card.</span>
+    </div>
+    <div class="ovscroll">
+      <table>
+        <thead><tr><th>Meter</th><th>Port</th><th>Unit ID</th><th>Setpoint m/s</th><th>Flow m/s</th><th>m&sup3;/h</th><th>Faults</th><th>Status</th><th>Last poll</th></tr></thead>
+        <tbody id="ovbody"></tbody>
+      </table>
+    </div>
+  </div>
+</section>
 <main id="cards"></main>
+<p id="empty" class="muted">No meter cards open. Click a meter in the table above to see and change its settings.</p>
 <div style="padding: 0 20px 16px;">
   <div class="card">
     <h2>Server log <span class="badge">rejected / unknown-unit requests appear here</span></h2>
@@ -67,14 +111,105 @@ async function api(url, body) {
   return r.json();
 }
 
-function build() {
-  main.innerHTML = "";
-  for (let i = 1; i <= 3; i++) {
+// Meters whose full settings card is open; remembered per browser.
+let openIds = [];
+try { openIds = JSON.parse(localStorage.getItem("openMeters") || "null") || null; } catch (e) { openIds = null; }
+let summary = [];
+let config = null;
+
+function saveOpen() {
+  try { localStorage.setItem("openMeters", JSON.stringify(openIds)); } catch (e) { /* ignore */ }
+}
+
+function toggleCard(i) {
+  if (openIds.includes(i)) closeCard(i);
+  else openCard(i);
+}
+
+function openCard(i) {
+  if (openIds.includes(i)) return;
+  openIds.push(i);
+  openIds.sort((a, b) => a - b);
+  saveOpen();
+  buildCard(i);
+  renderTable();
+  refresh();
+}
+
+function closeCard(i) {
+  openIds = openIds.filter(x => x !== i);
+  saveOpen();
+  const el = document.getElementById("m" + i);
+  if (el) el.remove();
+  renderTable();
+  document.getElementById("empty").style.display = openIds.length ? "none" : "";
+}
+
+function closeAll() { [...openIds].forEach(closeCard); }
+
+function openFiltered() {
+  filteredRows().slice(0, 12).forEach(m => { if (!openIds.includes(m.id)) openCard(m.id); });
+}
+
+async function setCount() {
+  const n = Number(document.getElementById("meterCount").value);
+  if (!(n >= 1)) return alert("Enter a number of 1 or more.");
+  if (config && n < config.count &&
+      !confirm(`Remove meters ${n + 1}-${config.count}? Their settings and counters are discarded.`)) return;
+  const r = await api("/api/meters/count", { count: n });
+  if (r.error) return alert(r.error);
+  openIds.filter(i => i > r.count).forEach(closeCard);
+  refresh();
+}
+
+async function copySettings(i) {
+  const to = prompt(`Copy meter ${i}'s settings (setpoint, vary, pipe, density, word order, faults, status bits, holding registers) to which meters?\nExamples: all   or   1-200   or   4,7,10-20`, "all");
+  if (!to) return;
+  const r = await api("/api/meters/copy", { from: i, to });
+  alert(r.error ? r.error : `Copied to ${r.copied} meter(s).`);
+}
+
+// Filter text: id list/ranges ("1-20, 45") and/or keywords "error", "warning", "fault"
+function filteredRows() {
+  const f = document.getElementById("filter").value.trim().toLowerCase();
+  if (!f) return summary;
+  const words = f.split(/[\s,]+/).filter(Boolean);
+  const sevs = words.filter(w => ["error", "warning", "ok"].includes(w));
+  const fault = words.includes("fault");
+  const ranges = words.map(w => w.match(/^(\d+)(?:-(\d+))?$/)).filter(Boolean)
+    .map(r => [Number(r[1]), Number(r[2] || r[1])]);
+  return summary.filter(m =>
+    (!ranges.length || ranges.some(([a, b]) => m.id >= Math.min(a, b) && m.id <= Math.max(a, b))) &&
+    (!sevs.length || sevs.includes(m.severity)) &&
+    (!fault || m.emptyPipe || m.error));
+}
+
+function renderTable() {
+  const rows = filteredRows();
+  document.getElementById("ovbody").innerHTML = rows.map(m => {
+    const faults = [m.emptyPipe ? "Empty pipe" : "", m.error ? "Device error" : ""].filter(Boolean).join(", ");
+    const sevText = m.severity === "ok" ? "OK" : m.severity.toUpperCase();
+    return `<tr class="${openIds.includes(m.id) ? "open" : ""}" onclick="toggleCard(${m.id})">
+      <td>Flowmeter ${m.id}</td><td>${m.port}</td><td>${m.unitId}</td>
+      <td>${fmt(m.targetSpeed, 2)}${m.vary ? " &plusmn;" : ""}</td><td>${fmt(m.flowSpeed, 3)}</td>
+      <td>${fmt(m.volumeFlowM3h, 2)}</td><td>${faults}</td>
+      <td><span class="sev ${m.severity}">${sevText}</span></td><td class="muted">${m.lastActivity || "never"}</td></tr>`;
+  }).join("");
+  document.getElementById("ovinfo").textContent =
+    rows.length === summary.length ? `${summary.length} meters` : `${rows.length} of ${summary.length} meters shown`;
+}
+
+function buildCard(i) {
+  if (document.getElementById("m" + i)) return;
+  document.getElementById("empty").style.display = "none";
+  {
     const c = document.createElement("div");
     c.className = "card";
     c.id = "m" + i;
     c.innerHTML = `
-      <h2>Flowmeter ${i} <span class="badge" id="b${i}">OK</span></h2>
+      <h2>Flowmeter ${i} <span><span class="muted" id="ep_${i}"></span> <span class="badge" id="b${i}">OK</span>
+        <button class="close" title="Close card" onclick="closeCard(${i})">&times;</button></span></h2>
+      <div class="row"><button onclick="copySettings(${i})">Copy these settings to other meters&hellip;</button></div>
       <div class="row">
         <label>Flow setpoint [m/s]</label>
         <input type="range" id="sl${i}" min="0" max="12" step="0.01" value="0">
@@ -155,7 +290,8 @@ function build() {
       </details>
       <label>Modbus client activity</label>
       <textarea class="log" id="log${i}" rows="6" readonly></textarea>`;
-    main.appendChild(c);
+    const next = [...main.children].find(el => Number(el.id.slice(1)) > i);
+    main.insertBefore(c, next || null);
     buildBitBoxes(i);
     document.getElementById("sl" + i).addEventListener("input", e => {
       document.getElementById("sp" + i).value = e.target.value;
@@ -185,8 +321,8 @@ function setVary(i) {
 }
 
 function toggleFlag(i, flag) {
-  const m = state.meters[i - 1];
-  api(`/api/meter/${i}`, { [flag]: !m[flag] });
+  const m = (state.detail || []).find(d => d.id === i);
+  if (m) api(`/api/meter/${i}`, { [flag]: !m[flag] });
 }
 
 function setHolding(i, addr) {
@@ -237,11 +373,31 @@ function renderFlags(el, d) {
   el.innerHTML = flags + unk || '<span style="color:#6fbf73;font-size:11px">OK</span>';
 }
 
+function renderConfig(cfg) {
+  const first = config === null;
+  config = cfg;
+  const cnt = document.getElementById("meterCount");
+  if (document.activeElement !== cnt) cnt.value = cfg.count;
+  cnt.max = cfg.maxMeters;
+  const ports = cfg.ports.map(p => `port ${p.port}: units ${p.units}`).join(" &middot; ");
+  document.getElementById("endpoints").innerHTML = `Modbus TCP ${ports || "-"} &middot; UI port ${location.port || 80}`;
+  if (first && openIds === null) openIds = Array.from({ length: Math.min(cfg.count, 3) }, (_, k) => k + 1);
+  openIds.filter(i => i > cfg.count).forEach(closeCard);
+  if (first) { openIds.forEach(buildCard); saveOpen(); }
+}
+
 async function refresh() {
   try {
-    state = await (await fetch("/api/state")).json();
-    for (const m of state.meters) {
+    const ids = (openIds || []).join(",");
+    state = await (await fetch("/api/state?summary=1" + (ids ? "&detail=" + ids : ""))).json();
+    renderConfig(state.config);
+    summary = state.meters;
+    renderTable();
+    document.getElementById("empty").style.display = openIds.length ? "none" : "";
+    for (const m of state.detail || []) {
       const i = m.id;
+      if (!document.getElementById("m" + i)) continue;
+      document.getElementById("ep_" + i).textContent = `port ${m.port} · unit ${m.unitId}`;
       const b = document.getElementById("b" + i);
       const sev = m.statusDeviceDecoded.severity === "error" || m.statusSensorDecoded.severity === "error" ? "error"
         : (m.statusDeviceDecoded.severity === "warning" || m.statusSensorDecoded.severity === "warning" ? "warning" : "ok");
@@ -306,7 +462,6 @@ async function refresh() {
   } catch (e) { /* retry next tick */ }
 }
 
-build();
 refresh();
 setInterval(refresh, 1000);
 </script>

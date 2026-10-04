@@ -8,8 +8,19 @@ const modbus = require("modbus-tcp");
 const MODBUS_PORT = Number(process.env.MODBUS_PORT || 502);
 const MODBUS_HOST = process.env.MODBUS_HOST || "0.0.0.0";
 const WEB_PORT = Number(process.env.WEB_PORT || 8081);
-const METER_COUNT = 3;
+const DEFAULT_METER_COUNT = Number(process.env.METER_COUNT || 3);
+const MAX_METERS = Number(process.env.MAX_METERS || 2000);
+// Modbus unit IDs are 1-247; meters beyond that spill onto the next TCP port.
+const UNITS_PER_PORT = Math.min(Math.max(Number(process.env.UNITS_PER_PORT || 247), 1), 247);
 const TICK_MS = 100;
+
+// Meter N (1-based) -> Modbus endpoint
+function endpointOf(id) {
+  return {
+    port: MODBUS_PORT + Math.floor((id - 1) / UNITS_PER_PORT),
+    unitId: ((id - 1) % UNITS_PER_PORT) + 1
+  };
+}
 
 // IFC050 status bit positions in the u32 (ABCD): u32 bit = (3 - byte) * 8 + bit-in-byte
 // Manual-toggleable bits per meter; flowSign / emptyPipeF / device error are auto-derived.
@@ -132,6 +143,7 @@ function makeMeter(id) {
 
   return {
     id,
+    ...endpointOf(id),
     holding,
     targetSpeed: 0.0,
     filtSpeed: 0.0,
@@ -189,29 +201,70 @@ function logWrite(m, fc, label, addr, value) {
 }
 
 const meters = [];
-for (let i = 1; i <= METER_COUNT; i++) meters.push(makeMeter(i));
 
-const SAVE_FILE = path.join(__dirname, "simulator-state.json");
+const SAVE_FILE = process.env.STATE_FILE || path.join(__dirname, "simulator-state.json");
+
+// Holding registers are stored sparsely ({index: value}, non-zero only) so the
+// state file stays small with hundreds of meters. Older files with a full array still load.
+function sparseHolding(holding) {
+  const out = {};
+  for (let j = 0; j < holding.length; j++) if (holding[j]) out[j] = holding[j];
+  return out;
+}
+
+// Settings a user configures; copied by "copy settings" and persisted.
+function meterSettings(m) {
+  return {
+    targetSpeed: m.targetSpeed,
+    vary: m.vary,
+    varyPct: m.varyPct,
+    pipeDiamMm: m.pipeDiamMm,
+    density: m.density,
+    emptyPipe: m.emptyPipe,
+    error: m.error,
+    sensorBits: { ...m.sensorBits },
+    deviceBits: { ...m.deviceBits },
+    wordOrder: m.wordOrder,
+    holding: sparseHolding(m.holding)
+  };
+}
+
+function applySettings(m, d) {
+  if (typeof d.targetSpeed === "number") m.targetSpeed = d.targetSpeed;
+  if (typeof d.vary === "boolean") m.vary = d.vary;
+  if (typeof d.varyPct === "number") m.varyPct = d.varyPct;
+  if (typeof d.pipeDiamMm === "number") m.pipeDiamMm = d.pipeDiamMm;
+  if (typeof d.density === "number") m.density = d.density;
+  if (typeof d.emptyPipe === "boolean") m.emptyPipe = d.emptyPipe;
+  if (typeof d.error === "boolean") m.error = d.error;
+  if (d.sensorBits && typeof d.sensorBits === "object") {
+    for (const k of Object.keys(SENSOR_BIT_POS)) m.sensorBits[k] = !!d.sensorBits[k];
+  }
+  if (d.deviceBits && typeof d.deviceBits === "object") {
+    for (const k of Object.keys(DEVICE_BIT_POS)) m.deviceBits[k] = !!d.deviceBits[k];
+  }
+  if (typeof d.wordOrder === "string") m.wordOrder = d.wordOrder;
+  if (Array.isArray(d.holding)) {
+    const n = Math.min(d.holding.length, m.holding.length);
+    for (let j = 0; j < n; j++) m.holding[j] = d.holding[j] & 0xffff;
+  } else if (d.holding && typeof d.holding === "object") {
+    m.holding.fill(0);
+    for (const [j, v] of Object.entries(d.holding)) {
+      const idx = Number(j);
+      if (idx >= 0 && idx < m.holding.length) m.holding[idx] = v & 0xffff;
+    }
+  }
+}
 
 function saveState() {
   try {
     const data = meters.map(m => ({
-      targetSpeed: m.targetSpeed,
-      vary: m.vary,
-      varyPct: m.varyPct,
-      pipeDiamMm: m.pipeDiamMm,
-      density: m.density,
+      ...meterSettings(m),
       c1run: m.c1run,
       c2run: m.c2run,
-      emptyPipe: m.emptyPipe,
-      error: m.error,
-      sensorBits: m.sensorBits,
-      deviceBits: m.deviceBits,
-      wordOrder: m.wordOrder,
       counter1: m.counter1,
       counter2: m.counter2,
-      operatingTime: m.operatingTime,
-      holding: Array.from(m.holding)
+      operatingTime: m.operatingTime
     }));
     fs.writeFileSync(SAVE_FILE, JSON.stringify(data));
   } catch (e) {
@@ -219,42 +272,37 @@ function saveState() {
   }
 }
 
+// The meter count comes from the saved state if there is one, else METER_COUNT.
 function loadState() {
+  let data = null;
   try {
-    if (!fs.existsSync(SAVE_FILE)) return;
-    const data = JSON.parse(fs.readFileSync(SAVE_FILE, "utf8"));
-    if (!Array.isArray(data)) return;
-    data.forEach((d, i) => {
-      const m = meters[i];
-      if (!m || !d) return;
-      if (typeof d.targetSpeed === "number") m.targetSpeed = d.targetSpeed;
-      if (typeof d.vary === "boolean") m.vary = d.vary;
-      if (typeof d.varyPct === "number") m.varyPct = d.varyPct;
-      if (typeof d.pipeDiamMm === "number") m.pipeDiamMm = d.pipeDiamMm;
-      if (typeof d.density === "number") m.density = d.density;
-      if (typeof d.c1run === "boolean") m.c1run = d.c1run;
-      if (typeof d.c2run === "boolean") m.c2run = d.c2run;
-      if (typeof d.emptyPipe === "boolean") m.emptyPipe = d.emptyPipe;
-      if (typeof d.error === "boolean") m.error = d.error;
-      if (d.sensorBits && typeof d.sensorBits === "object") {
-        for (const k of Object.keys(SENSOR_BIT_POS)) m.sensorBits[k] = !!d.sensorBits[k];
-      }
-      if (d.deviceBits && typeof d.deviceBits === "object") {
-        for (const k of Object.keys(DEVICE_BIT_POS)) m.deviceBits[k] = !!d.deviceBits[k];
-      }
-      if (typeof d.wordOrder === "string") m.wordOrder = d.wordOrder;
-      if (typeof d.counter1 === "number") m.counter1 = d.counter1;
-      if (typeof d.counter2 === "number") m.counter2 = d.counter2;
-      if (typeof d.operatingTime === "number") m.operatingTime = d.operatingTime;
-      if (Array.isArray(d.holding)) {
-        const n = Math.min(d.holding.length, m.holding.length);
-        for (let j = 0; j < n; j++) m.holding[j] = d.holding[j] & 0xffff;
-      }
-    });
-    console.log(`restored state from ${SAVE_FILE}`);
+    if (fs.existsSync(SAVE_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(SAVE_FILE, "utf8"));
+      if (Array.isArray(parsed) && parsed.length) data = parsed;
+    }
   } catch (e) {
     console.error("state load failed:", e.message);
   }
+  const count = clampCount(data ? data.length : DEFAULT_METER_COUNT);
+  for (let i = 1; i <= count; i++) meters.push(makeMeter(i));
+  if (!data) return;
+  data.slice(0, count).forEach((d, i) => {
+    const m = meters[i];
+    if (!d) return;
+    applySettings(m, d);
+    if (typeof d.c1run === "boolean") m.c1run = d.c1run;
+    if (typeof d.c2run === "boolean") m.c2run = d.c2run;
+    if (typeof d.counter1 === "number") m.counter1 = d.counter1;
+    if (typeof d.counter2 === "number") m.counter2 = d.counter2;
+    if (typeof d.operatingTime === "number") m.operatingTime = d.operatingTime;
+  });
+  console.log(`restored ${count} meters from ${SAVE_FILE}`);
+}
+
+function clampCount(n) {
+  n = Math.floor(Number(n));
+  if (!Number.isFinite(n) || n < 1) return 1;
+  return Math.min(n, MAX_METERS);
 }
 
 loadState();
@@ -384,8 +432,16 @@ function setCoilState(m, addr, value) {
   }
 }
 
-function meterOrNull(unitID) {
-  return meters[unitID - 1] || null;
+function meterOrNull(port, unitID) {
+  if (!(unitID >= 1 && unitID <= UNITS_PER_PORT)) return null;
+  return meters[(port - MODBUS_PORT) * UNITS_PER_PORT + unitID - 1] || null;
+}
+
+// Unit IDs served on a port, for log messages
+function unitRange(port) {
+  const first = (port - MODBUS_PORT) * UNITS_PER_PORT + 1;
+  const n = Math.max(0, Math.min(UNITS_PER_PORT, meters.length - first + 1));
+  return n ? `1-${n}` : "none";
 }
 
 function regBuf(v) {
@@ -404,134 +460,175 @@ function zeroBits(n) {
   return new Array(n).fill(0);
 }
 
-const mbServer = net.createServer((socket) => {
-  const peer = `${socket.remoteAddress}:${socket.remotePort}`;
-  slog(`client connected: ${peer}`);
-  socket.on("close", () => slog(`client disconnected: ${peer}`));
-  socket.on("error", (e) => slog(`client ${peer} socket error: ${e.message}`));
+function createModbusServer(port) {
+  const reject = (fc, unitId, what) =>
+    slog(`REJECTED ${fc} port=${port} unit=${unitId} ${what}: unknown unit ID (port ${port} serves units ${unitRange(port)})`);
 
-  const s = new modbus.Server();
-  s.on("error", () => {});
-  s.pipe(socket);
+  const server = net.createServer((socket) => {
+    const peer = `${socket.remoteAddress}:${socket.remotePort}`;
+    server.sockets.add(socket);
+    slog(`client connected: ${peer} -> port ${port}`);
+    socket.on("close", () => { server.sockets.delete(socket); slog(`client disconnected: ${peer} (port ${port})`); });
+    socket.on("error", (e) => slog(`client ${peer} socket error: ${e.message}`));
 
-  s.on("read-input-registers", (from, to, reply, data) => {
-    const m = meterOrNull(data.unitId);
-    if (!m) {
-      slog(`REJECTED FC04 unit=${data.unitId} ${from}-${to}: unknown unit ID (simulator serves 1-${METER_COUNT})`);
-      return reply(null, zeroRegs(to - from + 1));
-    }
-    logRange(m, "FC04", "InputReg", from, to);
-    const block = inputRegisterBlock(m);
-    const out = [];
-    for (let a = from; a <= to; a++) {
-      const n = normInput(a);
-      out.push(regBuf(n >= 0 && n < block.length ? block[n] : 0));
-    }
-    reply(null, out);
-  });
+    const s = new modbus.Server();
+    s.on("error", () => {});
+    s.pipe(socket);
 
-  s.on("read-holding-registers", (from, to, reply, data) => {
-    const m = meterOrNull(data.unitId);
-    if (!m) {
-      slog(`REJECTED FC03 unit=${data.unitId} ${from}-${to}: unknown unit ID (simulator serves 1-${METER_COUNT})`);
-      return reply(null, zeroRegs(to - from + 1));
-    }
-    logRange(m, "FC03", "HoldingReg", from, to);
-    const out = [];
-    for (let a = from; a <= to; a++) {
-      const n = normHolding(a);
-      out.push(regBuf(n >= 0 && n < m.holding.length ? m.holding[n] : 0));
-    }
-    reply(null, out);
-  });
-
-  const coilRead = (fc) => (from, to, reply, data) => {
-    const m = meterOrNull(data.unitId);
-    if (!m) {
-      slog(`REJECTED ${fc} unit=${data.unitId} ${from}-${to}: unknown unit ID (simulator serves 1-${METER_COUNT})`);
-      return reply(null, zeroBits(to - from + 1));
-    }
-    logRange(m, fc, "Coil", from, to);
-    const out = [];
-    for (let a = from; a <= to; a++) out.push(getCoilState(m, a) ? 1 : 0);
-    reply(null, out);
-  };
-  s.on("read-coils", coilRead("FC01"));
-  s.on("read-discrete-inputs", coilRead("FC02"));
-
-  s.on("write-single-coil", (address, value, reply, data) => {
-    const m = meterOrNull(data.unitId);
-    const v = value[0] === 0xff;
-    if (!m) {
-      slog(`REJECTED FC05 unit=${data.unitId} addr=${address}: unknown unit ID (simulator serves 1-${METER_COUNT})`);
-      return reply(null);
-    }
-    setCoilState(m, address, v);
-    logWrite(m, "FC05", "Coil", address, v ? 1 : 0);
-    reply(null);
-  });
-
-  s.on("write-multiple-coils", (from, to, items, reply, data) => {
-    const m = meterOrNull(data.unitId);
-    if (!m) {
-      slog(`REJECTED FC15 unit=${data.unitId} ${from}-${to}: unknown unit ID (simulator serves 1-${METER_COUNT})`);
-      return reply(null);
-    }
-    items.forEach((bit, i) => {
-      setCoilState(m, from + i, !!bit);
-      logWrite(m, "FC15", "Coil", from + i, bit);
+    s.on("read-input-registers", (from, to, reply, data) => {
+      const m = meterOrNull(port, data.unitId);
+      if (!m) {
+        reject("FC04", data.unitId, `${from}-${to}`);
+        return reply(null, zeroRegs(to - from + 1));
+      }
+      logRange(m, "FC04", "InputReg", from, to);
+      const block = inputRegisterBlock(m);
+      const out = [];
+      for (let a = from; a <= to; a++) {
+        const n = normInput(a);
+        out.push(regBuf(n >= 0 && n < block.length ? block[n] : 0));
+      }
+      reply(null, out);
     });
-    reply(null);
-  });
 
-  s.on("write-single-register", (address, value, reply, data) => {
-    const m = meterOrNull(data.unitId);
-    const v = value.readUInt16BE(0);
-    if (!m) {
-      slog(`REJECTED FC06 unit=${data.unitId} addr=${address}: unknown unit ID (simulator serves 1-${METER_COUNT})`);
-      return reply(null);
-    }
-    const n = normHolding(address);
-    if (n >= 0 && n < m.holding.length) m.holding[n] = v;
-    logWrite(m, "FC06", "HoldingReg", address, v);
-    reply(null);
-  });
+    s.on("read-holding-registers", (from, to, reply, data) => {
+      const m = meterOrNull(port, data.unitId);
+      if (!m) {
+        reject("FC03", data.unitId, `${from}-${to}`);
+        return reply(null, zeroRegs(to - from + 1));
+      }
+      logRange(m, "FC03", "HoldingReg", from, to);
+      const out = [];
+      for (let a = from; a <= to; a++) {
+        const n = normHolding(a);
+        out.push(regBuf(n >= 0 && n < m.holding.length ? m.holding[n] : 0));
+      }
+      reply(null, out);
+    });
 
-  s.on("write-multiple-registers", (from, to, items, reply, data) => {
-    const m = meterOrNull(data.unitId);
-    if (!m) {
-      slog(`REJECTED FC16 unit=${data.unitId} ${from}-${to}: unknown unit ID (simulator serves 1-${METER_COUNT})`);
-      return reply(null);
-    }
-    items.forEach((buf, i) => {
-      const n = normHolding(from + i);
-      const v = buf.readUInt16BE(0);
+    const coilRead = (fc) => (from, to, reply, data) => {
+      const m = meterOrNull(port, data.unitId);
+      if (!m) {
+        reject(fc, data.unitId, `${from}-${to}`);
+        return reply(null, zeroBits(to - from + 1));
+      }
+      logRange(m, fc, "Coil", from, to);
+      const out = [];
+      for (let a = from; a <= to; a++) out.push(getCoilState(m, a) ? 1 : 0);
+      reply(null, out);
+    };
+    s.on("read-coils", coilRead("FC01"));
+    s.on("read-discrete-inputs", coilRead("FC02"));
+
+    s.on("write-single-coil", (address, value, reply, data) => {
+      const m = meterOrNull(port, data.unitId);
+      const v = value[0] === 0xff;
+      if (!m) {
+        reject("FC05", data.unitId, `addr=${address}`);
+        return reply(null);
+      }
+      setCoilState(m, address, v);
+      logWrite(m, "FC05", "Coil", address, v ? 1 : 0);
+      reply(null);
+    });
+
+    s.on("write-multiple-coils", (from, to, items, reply, data) => {
+      const m = meterOrNull(port, data.unitId);
+      if (!m) {
+        reject("FC15", data.unitId, `${from}-${to}`);
+        return reply(null);
+      }
+      items.forEach((bit, i) => {
+        setCoilState(m, from + i, !!bit);
+        logWrite(m, "FC15", "Coil", from + i, bit);
+      });
+      reply(null);
+    });
+
+    s.on("write-single-register", (address, value, reply, data) => {
+      const m = meterOrNull(port, data.unitId);
+      const v = value.readUInt16BE(0);
+      if (!m) {
+        reject("FC06", data.unitId, `addr=${address}`);
+        return reply(null);
+      }
+      const n = normHolding(address);
       if (n >= 0 && n < m.holding.length) m.holding[n] = v;
-      logWrite(m, "FC16", "HoldingReg", from + i, v);
+      logWrite(m, "FC06", "HoldingReg", address, v);
+      reply(null);
     });
-    reply(null);
-  });
 
-  s.on("data", (d) => {
-    slog(`unsupported function code '${d.functionCode}' from unit=${d.unitId}`);
-  });
-});
+    s.on("write-multiple-registers", (from, to, items, reply, data) => {
+      const m = meterOrNull(port, data.unitId);
+      if (!m) {
+        reject("FC16", data.unitId, `${from}-${to}`);
+        return reply(null);
+      }
+      items.forEach((buf, i) => {
+        const n = normHolding(from + i);
+        const v = buf.readUInt16BE(0);
+        if (n >= 0 && n < m.holding.length) m.holding[n] = v;
+        logWrite(m, "FC16", "HoldingReg", from + i, v);
+      });
+      reply(null);
+    });
 
-mbServer.on("error", (e) => {
-  console.error("Modbus server error:", e.message);
-  process.exit(1);
-});
-mbServer.listen(MODBUS_PORT, MODBUS_HOST, () => {
-  console.log(`IFC050 Modbus TCP server (modbus-tcp) listening on ${MODBUS_HOST}:${MODBUS_PORT} (unit IDs 1-${METER_COUNT})`);
-});
+    s.on("data", (d) => {
+      slog(`unsupported function code '${d.functionCode}' from port=${port} unit=${d.unitId}`);
+    });
+  });
+  server.sockets = new Set();
+  return server;
+}
+
+// One TCP listener per block of UNITS_PER_PORT meters: 502 for 1-247, 503 for 248-494, ...
+const mbServers = new Map();
+
+function syncModbusPorts() {
+  const needed = Math.ceil(meters.length / UNITS_PER_PORT);
+  for (let k = 0; k < needed; k++) {
+    const port = MODBUS_PORT + k;
+    if (mbServers.has(port)) continue;
+    const server = createModbusServer(port);
+    mbServers.set(port, server);
+    server.on("error", (e) => {
+      slog(`Modbus server error on port ${port}: ${e.message}`);
+      if (port === MODBUS_PORT) process.exit(1);
+      mbServers.delete(port);
+    });
+    server.listen(port, MODBUS_HOST, () => {
+      slog(`Modbus TCP listening on ${MODBUS_HOST}:${port} (unit IDs ${unitRange(port)})`);
+    });
+  }
+  for (const [port, server] of mbServers) {
+    if (port - MODBUS_PORT < needed) continue;
+    mbServers.delete(port);
+    server.close();
+    for (const sock of server.sockets) sock.destroy();
+    slog(`Modbus TCP port ${port} closed (no meters left on it)`);
+  }
+}
+
+function setMeterCount(n) {
+  const count = clampCount(n);
+  while (meters.length < count) meters.push(makeMeter(meters.length + 1));
+  if (meters.length > count) meters.length = count;
+  syncModbusPorts();
+  saveState();
+  slog(`meter count set to ${count}`);
+}
+
+syncModbusPorts();
 
 const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
-function meterState(m) {
+function meterState(m, withLogs = true) {
   return {
     id: m.id,
+    port: m.port,
+    unitId: m.unitId,
     targetSpeed: m.targetSpeed,
     vary: m.vary,
     varyPct: m.varyPct,
@@ -555,7 +652,7 @@ function meterState(m) {
     sensorBits: m.sensorBits,
     deviceBits: m.deviceBits,
     wordOrder: m.wordOrder,
-    logs: m.logs,
+    ...(withLogs ? { logs: m.logs } : {}),
     holding: {
       flowDirection: m.holding[2000],
       pulseFilter: m.holding[2001],
@@ -576,8 +673,84 @@ function meterState(m) {
   };
 }
 
+function worstSeverity(m) {
+  const s = [decodeStatus(m.statusSensor, SENSOR_BIT_TABLE).severity, decodeStatus(m.statusDevice, DEVICE_BIT_TABLE).severity];
+  if (s.includes("error")) return "error";
+  if (s.includes("warning")) return "warning";
+  return "ok";
+}
+
+// Compact per-meter row for the overview table
+function meterSummary(m) {
+  return {
+    id: m.id,
+    port: m.port,
+    unitId: m.unitId,
+    targetSpeed: m.targetSpeed,
+    flowSpeed: m.dispSpeed,
+    volumeFlowM3h: m.dispVol * 3600,
+    vary: m.vary,
+    emptyPipe: m.emptyPipe,
+    error: m.error,
+    severity: worstSeverity(m),
+    lastActivity: m.logs.length ? m.logs[m.logs.length - 1].slice(1, 13) : null
+  };
+}
+
+function config() {
+  const ports = [];
+  for (const port of [...mbServers.keys()].sort((a, b) => a - b)) ports.push({ port, units: unitRange(port) });
+  return { count: meters.length, maxMeters: MAX_METERS, unitsPerPort: UNITS_PER_PORT, basePort: MODBUS_PORT, ports };
+}
+
+// Parse "1-10,15,20-25" (or "all") into meter ids, clamped to existing meters
+function parseIds(spec) {
+  const ids = new Set();
+  for (const part of String(spec || "").split(",")) {
+    const t = part.trim();
+    if (!t) continue;
+    if (t.toLowerCase() === "all") { meters.forEach(m => ids.add(m.id)); continue; }
+    const r = t.match(/^(\d+)\s*-\s*(\d+)$/);
+    const [a, b] = r ? [Number(r[1]), Number(r[2])] : [Number(t), Number(t)];
+    if (!Number.isInteger(a) || !Number.isInteger(b)) continue;
+    for (let i = Math.max(1, Math.min(a, b)); i <= Math.min(meters.length, Math.max(a, b)); i++) ids.add(i);
+  }
+  return [...ids];
+}
+
+// GET /api/state            -> all meters, full state without logs (used by verify scripts)
+// GET /api/state?summary=1  -> compact rows for the UI table
+// &detail=1,5,7             -> full state incl. logs for those meters
 app.get("/api/state", (req, res) => {
-  res.json({ meters: meters.map(meterState), serverLog });
+  const out = { config: config(), serverLog };
+  out.meters = req.query.summary ? meters.map(meterSummary) : meters.map(m => meterState(m, false));
+  if (req.query.detail) out.detail = parseIds(req.query.detail).map(id => meterState(meters[id - 1]));
+  res.json(out);
+});
+
+app.get("/api/meter/:id", (req, res) => {
+  const m = meters[Number(req.params.id) - 1];
+  if (!m) return res.status(404).json({ error: "unknown meter" });
+  res.json(meterState(m));
+});
+
+app.post("/api/meters/count", (req, res) => {
+  const n = Number(req.body && req.body.count);
+  if (!Number.isFinite(n) || n < 1) return res.status(400).json({ error: "count must be >= 1" });
+  setMeterCount(n);
+  res.json(config());
+});
+
+// Copy one meter's settings (setpoint, vary, geometry, word order, fault flags,
+// status bits, holding registers) onto other meters. Counters are not copied.
+app.post("/api/meters/copy", (req, res) => {
+  const src = meters[Number(req.body && req.body.from) - 1];
+  if (!src) return res.status(404).json({ error: "unknown source meter" });
+  const targets = parseIds(req.body.to).filter(id => id !== src.id);
+  const settings = meterSettings(src);
+  for (const id of targets) applySettings(meters[id - 1], settings);
+  saveState();
+  res.json({ copied: targets.length });
 });
 
 app.post("/api/meter/:id", (req, res) => {

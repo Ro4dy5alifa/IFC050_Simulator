@@ -4,7 +4,9 @@ A Node.js Modbus TCP simulator for the Krohne IFC050 electromagnetic flowmeter, 
 
 ## Features
 
-- **3 virtual flowmeters** on Modbus TCP port 502 (unit IDs 1-3)
+- **Any number of virtual flowmeters** (default 3, up to `MAX_METERS`), set from the web UI. Meters 1-247 are on Modbus TCP port 502 (unit IDs 1-247), meters 248-494 on port 503 (unit IDs 1-247), and so on
+- **Overview table** of all meters with filter (`1-20`, `error`, `fault`), plus full settings cards for the meters you open
+- **Copy settings** from one meter to others (`all`, `1-200`, `4,7,10-20`)
 - **Web UI** on port 8081 — dark theme, real-time updates
 - **Input registers (FC04)** at 30000+: flow speed, volume flow, mass flow, operating time, counters, status
 - **Holding registers (FC03/FC16)** at 42000/43000: flow direction, limitation, time constant, cutoff, zero point, electrode factor
